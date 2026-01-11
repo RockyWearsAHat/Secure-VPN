@@ -1,0 +1,26 @@
+# Byte-compiled / cache files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+
+# Environment files
+.env
+.env.local
+.envrc
+
+# Logs and coverage
+*.log
+.coverage
+htmlcov/
+
+# macOS artifacts
+.DS_Store
+
+# Keys and certificates
+*.key
+*.pem
+*.crt
