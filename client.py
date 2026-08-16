@@ -53,87 +53,100 @@ class VPNClient:
         self.local_server: Optional[asyncio.Server] = None
     
     async def connect(self):
-        """Connect to VPN server and perform handshake."""
+        """Verify the server is reachable and authentic, then serve locally.
+
+        Each local connection opens its OWN VPN session on demand (see
+        ``handle_local_connection``) rather than sharing one tunnel. A single
+        shared tunnel can only carry one stream — every parallel browser
+        connection would interleave into one target socket and corrupt it. A
+        session per local connection maps cleanly onto the server, which already
+        tunnels each VPN connection to its own target socket. This preflight
+        does one handshake up front so an authentication or reachability problem
+        surfaces immediately instead of on the first request.
+        """
         print(f"Connecting to VPN server at {self.server_host}:{self.server_port}...")
-        
+
         try:
-            self.vpn_reader, self.vpn_writer = await asyncio.open_connection(
-                self.server_host,
-                self.server_port
-            )
-            print("✓ Connected to VPN server")
-            
-            # Perform handshake
-            self.session_keys = await self.perform_handshake()
-            
-            if self.session_keys is None:
+            reader, writer = await asyncio.open_connection(self.server_host, self.server_port)
+            session_keys = await self.perform_handshake(reader, writer)
+            if session_keys is None:
                 raise ProtocolError("Handshake failed")
-            
-            print("✓ Handshake complete, secure tunnel established")
-            
-            # Start local SSH proxy
+            # Preflight only: close it, real traffic gets fresh sessions.
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except Exception:
+                pass
+            print("✓ Handshake complete, server authenticated, secure tunnel ready")
+
             await self.start_local_proxy()
-            
+
         except Exception as e:
             print(f"Connection failed: {e}")
             raise
-    
-    async def perform_handshake(self) -> Optional[SecurityKeys]:
+
+    async def _open_session(self):
+        """Open one VPN connection and complete the handshake.
+
+        Returns ``(vpn_reader, vpn_writer, session_keys)`` or raises. Callers own
+        the returned writer and must close it when the tunnel ends.
         """
-        Perform client-side handshake.
-        
+        vpn_reader, vpn_writer = await asyncio.open_connection(self.server_host, self.server_port)
+        session_keys = await self.perform_handshake(vpn_reader, vpn_writer)
+        if session_keys is None:
+            vpn_writer.close()
+            raise ProtocolError("Handshake failed")
+        return vpn_reader, vpn_writer, session_keys
+
+    async def perform_handshake(
+        self,
+        vpn_reader: asyncio.StreamReader,
+        vpn_writer: asyncio.StreamWriter,
+    ) -> Optional[SecurityKeys]:
+        """
+        Perform client-side handshake over the given connection.
+
         Returns:
             SecurityKeys on success, None on failure
         """
-        # Type guards: ensure connection is established
-        assert self.vpn_reader is not None, "VPN reader not initialized"
-        assert self.vpn_writer is not None, "VPN writer not initialized"
-        
         protocol = SecureVPNProtocol(self.identity, self.peer_public_key)
         buffer = b""
-        
+
         try:
             # Step 1: Send CLIENT_HELLO
-            print("Sending CLIENT_HELLO...")
             client_hello, state = protocol.create_client_hello()
-            self.vpn_writer.write(frame_packet(client_hello))
-            await self.vpn_writer.drain()
-            print("✓ CLIENT_HELLO sent")
-            
+            vpn_writer.write(frame_packet(client_hello))
+            await vpn_writer.drain()
+
             # Step 2: Receive SERVER_HELLO
-            print("Waiting for SERVER_HELLO...")
-            
             while True:
-                data = await asyncio.wait_for(self.vpn_reader.read(4096), timeout=30.0)
+                data = await asyncio.wait_for(vpn_reader.read(4096), timeout=30.0)
                 if not data:
                     raise ProtocolError("Connection closed during handshake")
-                
+
                 buffer += data
                 packet, buffer = parse_framed_packet(buffer)
-                
+
                 if packet:
                     break
-            
+
             # Process SERVER_HELLO
             session_keys = protocol.process_server_hello(packet, state)
-            print("✓ SERVER_HELLO received and verified")
-            
+
             # Step 3: Send CLIENT_AUTH
-            print("Sending CLIENT_AUTH...")
             client_auth = protocol.create_client_auth(state, session_keys)
-            self.vpn_writer.write(frame_packet(client_auth))
-            await self.vpn_writer.drain()
-            print("✓ CLIENT_AUTH sent")
-            
+            vpn_writer.write(frame_packet(client_auth))
+            await vpn_writer.drain()
+
             return session_keys
-        
+
         except asyncio.TimeoutError:
             print("Handshake timeout")
             return None
         except (ProtocolError, CryptoException) as e:
             print(f"Handshake error: {e}")
             return None
-    
+
     async def start_local_proxy(self):
         """Start local SSH proxy server."""
         self.local_server = await asyncio.start_server(
@@ -159,29 +172,27 @@ class VPNClient:
         """
         client_addr = local_writer.get_extra_info('peername')
         conn_id = f"{client_addr[0]}:{client_addr[1]}"
-        
-        print(f"[{conn_id}] New local SSH connection")
-        
-        # Type guards: ensure VPN connection is established
-        assert self.session_keys is not None, "VPN tunnel not established"
-        assert self.vpn_reader is not None, "VPN reader not initialized"
-        assert self.vpn_writer is not None, "VPN writer not initialized"
-        
-        # Type guards: ensure VPN connection is established
-        assert self.session_keys is not None, "VPN tunnel not established"
-        assert self.vpn_reader is not None, "VPN reader not initialized"
-        assert self.vpn_writer is not None, "VPN writer not initialized"
-        
+
+        print(f"[{conn_id}] New local connection")
+
+        # Each local connection gets its OWN authenticated VPN session and its
+        # own target socket on the server. This is what lets a browser open many
+        # parallel connections without their bytes interleaving in one tunnel.
+        try:
+            vpn_reader, vpn_writer, session_keys = await self._open_session()
+        except Exception as e:
+            print(f"[{conn_id}] Could not open VPN session: {e}")
+            try:
+                local_writer.close()
+            except Exception:
+                pass
+            return
+
         protocol = SecureVPNProtocol(self.identity, self.peer_public_key)
         vpn_buffer = b""
         bytes_tx = 0
         bytes_rx = 0
-        
-        # Local references for type checker (already asserted above)
-        session_keys = self.session_keys
-        vpn_reader = self.vpn_reader
-        vpn_writer = self.vpn_writer
-        
+
         try:
             async def local_to_vpn():
                 """Forward local SSH traffic to encrypted VPN"""
@@ -244,10 +255,15 @@ class VPNClient:
         except Exception as e:
             print(f"[{conn_id}] Error: {e}")
         finally:
+            # Tear down this connection's own VPN session and local socket.
+            try:
+                vpn_writer.close()
+            except Exception:
+                pass
             try:
                 local_writer.close()
                 await local_writer.wait_closed()
-            except:
+            except Exception:
                 pass
             print(f"[{conn_id}] Connection closed (TX: {bytes_tx} bytes, RX: {bytes_rx} bytes)")
     
@@ -279,6 +295,8 @@ async def main():
     parser.add_argument("--identity", default=os.getenv("SECUREVPN_CLIENT_IDENTITY", "client"), help="Identity name (default: client)")
     parser.add_argument("--peer", default=os.getenv("SECUREVPN_CLIENT_PEER", "server"), help="Peer name (default: server)")
     parser.add_argument("--password", help="Password for encrypted identity key")
+    parser.add_argument("--key-dir", default=os.getenv("SECUREVPN_KEY_DIR"),
+                        help="Directory holding identity/peer keys (default: ~/.securevpn/keys)")
     args = parser.parse_args()
 
     if not args.server:
@@ -288,7 +306,8 @@ async def main():
         args.password = os.getenv("SECUREVPN_CLIENT_PASSWORD")
     
     # Load keys
-    km = KeyManager()
+    from pathlib import Path as _Path
+    km = KeyManager(_Path(args.key_dir)) if args.key_dir else KeyManager()
     
     try:
         print("Loading client identity...")

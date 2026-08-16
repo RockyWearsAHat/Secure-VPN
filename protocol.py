@@ -4,10 +4,11 @@ SecureVPN Protocol Implementation
 Handles the handshake protocol and packet framing.
 """
 
+import hmac
 import struct
 import time
 from enum import IntEnum
-from typing import Tuple, Optional
+from typing import Dict, Tuple, Optional
 from dataclasses import dataclass
 
 from crypto_core import (
@@ -41,6 +42,9 @@ class HandshakeState:
     peer_ephemeral_pubkey: Optional[bytes] = None
     client_timestamp: Optional[float] = None
     server_timestamp: Optional[float] = None
+    # Which roster entry this handshake resolved to, for the log line and for
+    # revocation. None on the client side, where there is only ever one peer.
+    peer_name: Optional[str] = None
 
 
 class SecureVPNProtocol:
@@ -58,18 +62,69 @@ class SecureVPNProtocol:
     MAX_TIMESTAMP_SKEW = 300.0  # 5 minutes
     MAX_PACKET_SIZE = 65535
     
-    def __init__(self, identity: IdentityKeys, peer_identity_pubkey: bytes):
+    def __init__(
+        self,
+        identity: IdentityKeys,
+        peer_identity_pubkey: Optional[bytes] = None,
+        peer_roster: Optional[Dict[str, bytes]] = None,
+    ):
         """
         Initialize protocol handler.
-        
+
         Args:
             identity: Our identity keys
-            peer_identity_pubkey: Peer's 32-byte public identity key
+            peer_identity_pubkey: The one peer we expect. This is what a client
+                uses — it knows exactly which server it is dialling — and it is
+                also the server's single-peer shape, kept so a deployment that
+                passes one key behaves exactly as it did before rosters existed.
+            peer_roster: {name: 32-byte public key} — the server's authorised
+                set. When given, the peer is *selected* by the identity key the
+                client presents in CLIENT_HELLO and then verified against that
+                one key for the remainder of the handshake, exactly as the
+                single-key path does. Selecting by presented key is not a
+                weakening: the key is public, and possession of the matching
+                private key is still proven by the Ed25519 signature over the
+                transcript in CLIENT_AUTH. A key that is not in the roster is
+                refused with the same error an unknown key always got.
+
+        Raises:
+            ValueError: If neither a peer nor a roster is given, which would be
+                a server that authorises everybody.
         """
+        if peer_identity_pubkey is None and not peer_roster:
+            raise ValueError(
+                "a protocol handler needs either peer_identity_pubkey or a "
+                "non-empty peer_roster; refusing to run with no authorised peer"
+            )
         self.identity = identity
         self.peer_identity_pubkey = peer_identity_pubkey
+        self.peer_roster = dict(peer_roster) if peer_roster else None
         self.session_keys: Optional[SecurityKeys] = None
         self.handshake_complete = False
+
+    def _resolve_peer(self, presented_pubkey: bytes) -> Tuple[Optional[str], Optional[bytes]]:
+        """
+        Find the authorised peer whose identity key the client presented.
+
+        Every candidate is compared with `hmac.compare_digest` and the loop is
+        not short-circuited, so the time this takes does not depend on which
+        entry matched or on how far down the roster it sits.
+
+        Returns:
+            (name, key) for a match, (None, None) for a key nobody holds.
+        """
+        matched_name: Optional[str] = None
+        matched_key: Optional[bytes] = None
+
+        if self.peer_roster is not None:
+            for name, key in self.peer_roster.items():
+                if hmac.compare_digest(presented_pubkey, key):
+                    matched_name, matched_key = name, key
+        elif self.peer_identity_pubkey is not None:
+            if hmac.compare_digest(presented_pubkey, self.peer_identity_pubkey):
+                matched_key = self.peer_identity_pubkey
+
+        return matched_name, matched_key
     
     # ========== Client-side handshake ==========
     
@@ -231,10 +286,13 @@ class SecureVPNProtocol:
         if not validate_timestamp(client_time, self.MAX_TIMESTAMP_SKEW):
             raise ProtocolError("Client timestamp out of acceptable range")
         
-        # Verify client identity matches expected
-        if client_id_pub != self.peer_identity_pubkey:
+        # Select the authorised peer this key belongs to. With one peer
+        # configured this is the same comparison it always was; with a roster it
+        # is a lookup, and a key nobody holds fails here with the same message.
+        peer_name, expected_pubkey = self._resolve_peer(client_id_pub)
+        if expected_pubkey is None:
             raise ProtocolError("Client identity key mismatch")
-        
+
         # Generate our ephemeral key
         kex = KeyExchange()
         server_time = time.time()
@@ -267,13 +325,17 @@ class SecureVPNProtocol:
         
         state = HandshakeState(
             identity=self.identity,
-            peer_identity_pubkey=self.peer_identity_pubkey,
+            # The resolved key, not the handler's — from here on this handshake
+            # is bound to exactly one peer, so CLIENT_AUTH cannot be answered by
+            # a different roster entry than CLIENT_HELLO claimed to be.
+            peer_identity_pubkey=expected_pubkey,
             ephemeral_exchange=kex,
             peer_ephemeral_pubkey=client_eph_pub,
             client_timestamp=client_time,
-            server_timestamp=server_time
+            server_timestamp=server_time,
+            peer_name=peer_name
         )
-        
+
         return server_hello, state, session_keys
     
     def process_client_auth(self, packet: bytes, state: HandshakeState, session_keys: SecurityKeys) -> bool:
@@ -304,8 +366,10 @@ class SecureVPNProtocol:
             if pkt_type != PacketType.CLIENT_AUTH:
                 raise ProtocolError(f"Expected CLIENT_AUTH, got {pkt_type}")
             
-            # Verify client identity
-            if client_id_pub != self.peer_identity_pubkey:
+            # Verify client identity against the key THIS handshake resolved to
+            # in CLIENT_HELLO, never against the handler's roster: presenting one
+            # roster key in the hello and another in the auth must not pass.
+            if not hmac.compare_digest(client_id_pub, state.peer_identity_pubkey):
                 raise ProtocolError("Client identity mismatch in AUTH")
             
             # Type guard: ensure state is complete
