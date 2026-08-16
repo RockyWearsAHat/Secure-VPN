@@ -11,7 +11,8 @@ import signal
 import subprocess
 import sys
 from contextlib import AbstractContextManager
-from typing import Optional
+from pathlib import Path as _PathType
+from typing import Dict, Optional
 
 from crypto_core import IdentityKeys, SecurityKeys, CryptoException
 from protocol import SecureVPNProtocol, ProtocolError, frame_packet, parse_framed_packet
@@ -135,15 +136,112 @@ class SSHServiceManager(AbstractContextManager["SSHServiceManager"]):
         return False
 
 
+class Roster:
+    """
+    Who may complete a handshake, resolved at the moment one is attempted.
+
+    # Why this is a file the server re-reads, and not a list it was started with
+
+    Enrolling somebody has to be possible *while the tunnel is up*. The first
+    version took its peers from `--peer` flags and loaded them once in `main()`,
+    which meant adding a person required restarting the VPN server — dropping
+    every live tunnel, including the operator's own, to let a new one exist. That
+    turns "let my dad in" into an outage, so in practice it never gets done as a
+    product: it gets done by hand, over SSH, by the one person who already has
+    access. Which is exactly the deadlock this whole enrolment path exists to
+    break.
+
+    So the authority is `<key-dir>/roster`: one peer name per line, `#` for
+    comments, blank lines ignored. Adding a person is writing their `<name>.pub`
+    into the key directory and their name into that file — two owner-only writes,
+    no restart, no dropped tunnels.
+
+    **Naming is still explicit.** The directory is never scanned for whatever
+    `.pub` files happen to be sitting in it, because a file appearing in a folder
+    must not be an authorisation. A name in the roster is a decision somebody
+    made; a file on disk is not. Both the roster and the key directory are
+    owner-only (`SYSTEM` + `Administrators` on the box), so writing either one
+    already requires the privilege that could rewrite this server anyway.
+    """
+
+    def __init__(self, key_dir: Optional[str], names: list, roster_path: Optional[str]):
+        self.key_manager = KeyManager(_PathType(key_dir)) if key_dir else KeyManager()
+        # Names given on the command line are permanent members: they are how the
+        # operator's own client stays authorised even if the roster file is lost.
+        self.pinned = list(dict.fromkeys(names))
+        self.roster_path = roster_path
+        self._seen = None
+        self._cache: Dict[str, bytes] = {}
+        self._loaded_names: list = []
+
+    def _stamp(self):
+        """The roster file's identity, or None when there is no file."""
+        if not self.roster_path:
+            return None
+        try:
+            info = os.stat(self.roster_path)
+            return (info.st_mtime, info.st_size)
+        except OSError:
+            return None
+
+    def _names_now(self) -> list:
+        """Pinned names plus whatever the roster file currently lists."""
+        names = list(self.pinned)
+        if self.roster_path:
+            try:
+                # utf-8-sig, not utf-8: PowerShell's `Set-Content -Encoding utf8`
+                # writes a byte-order mark, and read as plain utf-8 that mark
+                # glues itself to the first line — which turned the leading
+                # comment into a peer name that no key could be found for. The
+                # entry was skipped and announced, so it was cosmetic rather than
+                # dangerous, but a roster an operator edits on Windows must
+                # tolerate what Windows editors actually write.
+                with open(self.roster_path, "r", encoding="utf-8-sig") as handle:
+                    for line in handle:
+                        entry = line.split("#", 1)[0].strip().lstrip("﻿").strip()
+                        if entry:
+                            names.append(entry)
+            except OSError:
+                # A missing roster is an empty one; the pinned names still stand,
+                # so losing the file degrades to the previous behaviour rather
+                # than locking everybody out.
+                pass
+        return list(dict.fromkeys(names))
+
+    def current(self) -> Dict[str, bytes]:
+        """
+        The authorised {name: public key} map, reloaded when the roster changed.
+
+        A name whose `.pub` cannot be read is skipped and announced rather than
+        being fatal: one unreadable key must not take the tunnel down for
+        everybody else.
+        """
+        stamp = self._stamp()
+        if stamp != self._seen or not self._cache:
+            names = self._names_now()
+            fresh: Dict[str, bytes] = {}
+            for name in names:
+                try:
+                    fresh[name] = self.key_manager.load_peer_public_key(name)
+                except (FileNotFoundError, ValueError) as error:
+                    print(f"roster: {name}: {error} — skipped")
+            if names != self._loaded_names:
+                print(f"roster: {len(fresh)} authorised client(s): {', '.join(sorted(fresh))}")
+                self._loaded_names = names
+            self._cache = fresh
+            self._seen = stamp
+        return self._cache
+
+
 class VPNServer:
     """
     VPN server that accepts connections and tunnels to local SSH.
     """
-    
+
     def __init__(
         self,
         identity: IdentityKeys,
-        peer_public_key: bytes,
+        roster: "Roster",
         listen_host: str = "0.0.0.0",
         listen_port: int = 8443,
         ssh_host: str = "127.0.0.1",
@@ -151,24 +249,47 @@ class VPNServer:
     ):
         """
         Initialize VPN server.
-        
+
         Args:
             identity: Server identity keys
-            peer_public_key: Expected client public key (32 bytes)
+            roster: Who may connect, resolved per handshake — see [`Roster`].
+                One entry per person, never one entry shared between people: the
+                name is what the log line reports and what removing an entry
+                revokes, and a key two people hold is a key neither of them can
+                be held to.
             listen_host: Host to listen on
             listen_port: Port to listen on
             ssh_host: Local SSH server host
             ssh_port: Local SSH server port
+
+        Raises:
+            ValueError: If the roster is empty at start-up. A server with no
+                authorised peer is refused rather than started, because the
+                failure it would otherwise produce — every handshake rejected —
+                looks exactly like a client misconfiguration and gets debugged
+                from the wrong end. It may legitimately become empty later, by
+                the operator revoking everybody; that is a running server with
+                nobody authorised, which is a different and intended thing.
         """
+        if not roster.current():
+            raise ValueError("the roster is empty: no client could ever connect")
         self.identity = identity
-        self.peer_public_key = peer_public_key
+        self.roster = roster
         self.listen_host = listen_host
         self.listen_port = listen_port
         self.ssh_host = ssh_host
         self.ssh_port = ssh_port
         self.server: Optional[asyncio.Server] = None
         self.active_connections = 0
-    
+        # Hard ceiling on concurrent connections and an overall wall-clock bound
+        # on the (pre-authentication) handshake. Without these, an unauthenticated
+        # attacker on the public listener can hold sockets open by dribbling one
+        # byte per read (each read resets its own timeout) and exhaust file
+        # descriptors / event-loop tasks — a trivial remote denial of service on
+        # the only internet-facing port. Neither limit affects a legitimate client.
+        self.max_connections = 256
+        self.handshake_timeout = 30.0
+
     async def start(self):
         """Start the VPN server."""
         self.server = await asyncio.start_server(
@@ -195,18 +316,35 @@ class VPNServer:
         """
         client_addr = writer.get_extra_info('peername')
         conn_id = f"{client_addr[0]}:{client_addr[1]}"
+
+        # Refuse new connections once at capacity, before counting this one, so a
+        # flood of stalled pre-auth sockets cannot starve legitimate clients.
+        if self.active_connections >= self.max_connections:
+            print(f"[{conn_id}] Refused: connection limit ({self.max_connections}) reached")
+            try:
+                writer.close()
+            except Exception:
+                pass
+            return
+
         self.active_connections += 1
-        
+
         print(f"[{conn_id}] New connection")
-        
+
         try:
-            # Perform handshake
-            session_keys = await self.perform_handshake(reader, writer, conn_id)
-            
-            if session_keys is None:
+            # Perform handshake under an overall wall-clock deadline. The per-read
+            # timeout inside perform_handshake resets on every byte received, so
+            # only this outer bound actually caps a slow-drip handshake.
+            result = await asyncio.wait_for(
+                self.perform_handshake(reader, writer, conn_id),
+                timeout=self.handshake_timeout,
+            )
+
+            if result is None:
                 print(f"[{conn_id}] Handshake failed")
                 return
-            
+
+            session_keys, leftover = result
             print(f"[{conn_id}] ✓ Handshake complete, tunnel established")
             
             # Create SSH connection
@@ -221,9 +359,12 @@ class VPNServer:
                 print(f"[{conn_id}] ✗ Failed to connect to SSH: {e}")
                 return
             
-            # Tunnel traffic bidirectionally
-            await self.tunnel_traffic(reader, writer, ssh_reader, ssh_writer, session_keys, conn_id)
-            
+            # Tunnel traffic bidirectionally, seeding any request bytes the
+            # handshake over-read past CLIENT_AUTH.
+            await self.tunnel_traffic(reader, writer, ssh_reader, ssh_writer, session_keys, conn_id, leftover)
+
+        except asyncio.TimeoutError:
+            print(f"[{conn_id}] Handshake deadline exceeded ({self.handshake_timeout}s) - dropped")
         except Exception as e:
             print(f"[{conn_id}] Error: {e}")
         finally:
@@ -240,14 +381,17 @@ class VPNServer:
         reader: asyncio.StreamReader,
         writer: asyncio.StreamWriter,
         conn_id: str
-    ) -> Optional[SecurityKeys]:
+    ) -> Optional[tuple]:
         """
         Perform server-side handshake.
-        
+
         Returns:
-            SecurityKeys on success, None on failure
+            (SecurityKeys, leftover_bytes) on success, None on failure.
+            leftover_bytes are any bytes read past CLIENT_AUTH — the client's
+            first DATA packet(s) can arrive coalesced in the same TCP segment,
+            and dropping them would strand the first request forever.
         """
-        protocol = SecureVPNProtocol(self.identity, self.peer_public_key)
+        protocol = SecureVPNProtocol(self.identity, peer_roster=self.roster.current())
         buffer = b""
         
         try:
@@ -267,8 +411,11 @@ class VPNServer:
             
             # Process CLIENT_HELLO and generate SERVER_HELLO
             server_hello, state, session_keys = protocol.process_client_hello(packet)
-            
-            print(f"[{conn_id}] ✓ CLIENT_HELLO received")
+
+            # Name the peer as soon as the key is recognised. Which person is on
+            # the tunnel is the fact this log exists to record, and it is the
+            # only way an operator can tell two authorised clients apart.
+            print(f"[{conn_id}] ✓ CLIENT_HELLO received from peer '{state.peer_name}'")
             
             # Step 2: Send SERVER_HELLO
             writer.write(frame_packet(server_hello))
@@ -293,7 +440,9 @@ class VPNServer:
             # Verify CLIENT_AUTH
             if protocol.process_client_auth(packet, state, session_keys):
                 print(f"[{conn_id}] ✓ CLIENT_AUTH verified")
-                return session_keys
+                # `buffer` now holds anything read past CLIENT_AUTH — hand it to
+                # the tunnel so a coalesced first request is not lost.
+                return session_keys, buffer
             else:
                 print(f"[{conn_id}] ✗ CLIENT_AUTH verification failed")
                 return None
@@ -312,42 +461,51 @@ class VPNServer:
         ssh_reader: asyncio.StreamReader,
         ssh_writer: asyncio.StreamWriter,
         session_keys: SecurityKeys,
-        conn_id: str
+        conn_id: str,
+        initial_buffer: bytes = b"",
     ):
         """
         Bidirectional tunnel between VPN and SSH.
+
+        initial_buffer carries any VPN bytes the handshake over-read (the first
+        DATA packet can arrive coalesced with CLIENT_AUTH); it is decoded before
+        reading further from the socket.
         """
-        protocol = SecureVPNProtocol(self.identity, self.peer_public_key)
-        vpn_buffer = b""
+        protocol = SecureVPNProtocol(self.identity, peer_roster=self.roster.current())
+        vpn_buffer = initial_buffer
         bytes_tx = 0
         bytes_rx = 0
         
         async def vpn_to_ssh():
             """Forward decrypted VPN traffic to SSH"""
             nonlocal vpn_buffer, bytes_rx
-            
+
+            async def drain_buffer():
+                """Decode and forward every complete packet already buffered."""
+                nonlocal vpn_buffer, bytes_rx
+                while True:
+                    packet, vpn_buffer = parse_framed_packet(vpn_buffer)
+                    if packet is None:
+                        break
+                    payload = protocol.parse_data_packet(packet, session_keys)
+                    bytes_rx += len(payload)
+                    ssh_writer.write(payload)
+                    await ssh_writer.drain()
+
             try:
+                # Process any bytes carried over from the handshake first, so a
+                # request coalesced with CLIENT_AUTH is forwarded without waiting
+                # for a further read that may never come.
+                await drain_buffer()
+
                 while True:
                     data = await vpn_reader.read(8192)
                     if not data:
                         break
-                    
+
                     vpn_buffer += data
-                    
-                    # Process all complete packets in buffer
-                    while True:
-                        packet, vpn_buffer = parse_framed_packet(vpn_buffer)
-                        if packet is None:
-                            break
-                        
-                        # Decrypt packet
-                        payload = protocol.parse_data_packet(packet, session_keys)
-                        bytes_rx += len(payload)
-                        
-                        # Forward to SSH
-                        ssh_writer.write(payload)
-                        await ssh_writer.drain()
-            
+                    await drain_buffer()
+
             except Exception as e:
                 print(f"[{conn_id}] VPN->SSH error: {e}")
             finally:
@@ -394,24 +552,55 @@ async def main():
     parser.add_argument("--ssh-host", default=os.getenv("SECUREVPN_SERVER_SSH_HOST", "127.0.0.1"), help="SSH server host (default: 127.0.0.1)")
     parser.add_argument("--ssh-port", type=int, default=int(os.getenv("SECUREVPN_SERVER_SSH_PORT", "22")), help="SSH server port (default: 22)")
     parser.add_argument("--identity", default=os.getenv("SECUREVPN_SERVER_IDENTITY", "server"), help="Identity name (default: server)")
-    parser.add_argument("--peer", default=os.getenv("SECUREVPN_SERVER_PEER", "client"), help="Peer name (default: client)")
+    parser.add_argument("--peer", action="append", metavar="NAME",
+                        help="Authorised client identity, by key name. Repeat it once per "
+                             "person: --peer client --peer dad. Each name must have a "
+                             "<name>.pub in the key directory. Defaults to the single peer "
+                             "'client', or to SECUREVPN_SERVER_PEER, which may be a "
+                             "comma-separated list.")
+    parser.add_argument("--roster", metavar="FILE",
+                        help="File listing authorised client names, one per line, re-read on "
+                             "every handshake so a person can be enrolled without restarting "
+                             "the tunnel. Default: <key-dir>/roster.")
     parser.add_argument("--password", help="Password for encrypted identity key")
+    parser.add_argument("--key-dir", default=os.getenv("SECUREVPN_KEY_DIR"),
+                        help="Directory holding identity/peer keys (default: ~/.securevpn/keys)")
     args = parser.parse_args()
 
     if not args.password:
         args.password = os.getenv("SECUREVPN_SERVER_PASSWORD")
     
     # Load keys
-    km = KeyManager()
+    from pathlib import Path as _Path
+    km = KeyManager(_Path(args.key_dir)) if args.key_dir else KeyManager()
     
     try:
         print("Loading server identity...")
         identity = km.load_identity(args.identity, args.password)
         print("✓ Server identity loaded")
         
-        print("Loading client public key...")
-        peer_pubkey = km.load_peer_public_key(args.peer)
-        print("✓ Client public key loaded\n")
+        # Pinned peers: the `--peer` flags, or the env var, or the historical
+        # single peer 'client'. These stay authorised even if the roster file is
+        # deleted, which is what keeps the operator's own client from being
+        # locked out by a lost or corrupted file.
+        pinned = args.peer or [
+            name.strip()
+            for name in os.getenv("SECUREVPN_SERVER_PEER", "client").split(",")
+            if name.strip()
+        ]
+        # Everybody else is enrolled through the roster file, which is re-read
+        # per handshake so adding a person never costs a restart.
+        roster_path = args.roster
+        if roster_path is None:
+            base = args.key_dir or str(KeyManager.DEFAULT_KEY_DIR)
+            roster_path = str(_PathType(base) / "roster")
+
+        roster = Roster(args.key_dir, pinned, roster_path)
+        print(f"Roster file: {roster_path}")
+        if not roster.current():
+            print("Error: nobody is authorised; the server would refuse every client.")
+            sys.exit(1)
+        print()
     except FileNotFoundError as e:
         print(f"Error: {e}")
         print("\nRun key_manager.py first to generate keys.")
@@ -423,7 +612,7 @@ async def main():
     # Start server
     server = VPNServer(
         identity=identity,
-        peer_public_key=peer_pubkey,
+        roster=roster,
         listen_host=args.host,
         listen_port=args.port,
         ssh_host=args.ssh_host,
