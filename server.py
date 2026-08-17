@@ -12,7 +12,7 @@ import subprocess
 import sys
 from contextlib import AbstractContextManager
 from pathlib import Path as _PathType
-from typing import Dict, Optional
+from typing import Dict, Optional, Tuple
 
 from crypto_core import IdentityKeys, SecurityKeys, CryptoException
 from protocol import SecureVPNProtocol, ProtocolError, frame_packet, parse_framed_packet
@@ -233,6 +233,108 @@ class Roster:
         return self._cache
 
 
+def parse_peer_forwards(specs: Optional[list]) -> Dict[str, Tuple[str, int]]:
+    """
+    `--peer-forward NAME=HOST:PORT`, repeated, into `{name: (host, port)}`.
+
+    # Why a peer would get a socket of its own
+
+    The tunnel already knows exactly who is on it: `process_client_hello`
+    resolves the presented identity key to one roster entry, `process_client_auth`
+    proves possession of the matching private key, and `HandshakeState.peer_name`
+    carries the answer. Up to now that answer was printed in a log line and then
+    thrown away — every authorised session was forwarded to the same
+    `--ssh-host`/`--ssh-port`, so the service on the other side saw one loopback
+    connection from `127.0.0.1` and could not tell two people apart. The tunnel
+    admitted people to a network and never said *who*, which is why it could not
+    be used as a permissions layer by anything above it.
+
+    A per-peer forward is the smallest fix that changes nothing on the wire:
+    peer A's sessions land on `127.0.0.1:9443`, peer B's on `127.0.0.1:9444`, and
+    the destination socket the local service accepted on *is* the roster entry.
+    The identity is known from the handshake and the kernel reports the
+    destination, so nothing new is parsed and no new packet type exists.
+
+    **A destination port is evidence, not proof.** Any process already running on
+    this machine can connect to a loopback port and be taken for that peer, and
+    the port numbers are in a config file rather than being secrets. What this
+    buys is attribution for sessions that came through the tunnel, not a new
+    authentication boundary — a credential that names a person is still what
+    proves who somebody is.
+
+    # What is refused here, and why each refusal exists
+
+    A malformed spec, a duplicate peer, and two peers sharing one socket are all
+    refused at start-up rather than tolerated, because each of them ends with a
+    port that does not mean one person:
+
+    - **No `=`, an empty name, or a socket that is not `HOST:PORT`** — a typo that
+      was quietly ignored would leave that peer on the shared forward, which is
+      the exact behaviour this flag exists to end, on a deployment whose config
+      says otherwise.
+    - **The same peer named twice** — one of the two mappings would win by
+      dictionary order, so which socket a person lands on would depend on
+      argument order rather than on anything written down.
+    - **Two peers pointed at one socket** — two people behind one port is two
+      people behind one identity, and every record written from that port would
+      name whichever of them the reader guessed.
+
+    Returns:
+        {peer name: (host, port)}, empty when nothing was given.
+
+    Raises:
+        ValueError: On any of the above, naming the offending spec.
+    """
+    forwards: Dict[str, Tuple[str, int]] = {}
+    claimed: Dict[Tuple[str, int], str] = {}
+
+    for spec in specs or []:
+        name, separator, socket_text = spec.partition("=")
+        name = name.strip()
+        if not separator or not name or not socket_text.strip():
+            raise ValueError(f"--peer-forward {spec!r}: expected NAME=HOST:PORT")
+
+        socket_text = socket_text.strip()
+        # `[::1]:9443` as well as `127.0.0.1:9443`: an IPv6 address contains the
+        # separator this is split on, so the bracketed form has to be read before
+        # the last colon means anything.
+        if socket_text.startswith("["):
+            host, closing, port_text = socket_text.partition("]:")
+            host = host[1:]
+            if not closing:
+                raise ValueError(f"--peer-forward {spec!r}: expected [ADDRESS]:PORT")
+        else:
+            host, separator, port_text = socket_text.rpartition(":")
+            if not separator:
+                raise ValueError(f"--peer-forward {spec!r}: expected HOST:PORT")
+
+        if not host:
+            raise ValueError(f"--peer-forward {spec!r}: no host in {socket_text!r}")
+
+        try:
+            port = int(port_text)
+        except ValueError:
+            raise ValueError(f"--peer-forward {spec!r}: {port_text!r} is not a port")
+        if not 1 <= port <= 65535:
+            # Port 0 asks the kernel to choose, which cannot be written into a
+            # config, dialled, or acted on by whatever is meant to be listening.
+            raise ValueError(f"--peer-forward {spec!r}: port {port} is out of range")
+
+        if name in forwards:
+            raise ValueError(f"--peer-forward {spec!r}: peer '{name}' already has a forward")
+        owner = claimed.get((host, port))
+        if owner is not None:
+            raise ValueError(
+                f"--peer-forward {spec!r}: {host}:{port} is already peer '{owner}'s; "
+                "a socket that carries two people names neither of them"
+            )
+
+        forwards[name] = (host, port)
+        claimed[(host, port)] = name
+
+    return forwards
+
+
 class VPNServer:
     """
     VPN server that accepts connections and tunnels to local SSH.
@@ -245,7 +347,8 @@ class VPNServer:
         listen_host: str = "0.0.0.0",
         listen_port: int = 8443,
         ssh_host: str = "127.0.0.1",
-        ssh_port: int = 22
+        ssh_port: int = 22,
+        peer_forwards: Optional[Dict[str, Tuple[str, int]]] = None
     ):
         """
         Initialize VPN server.
@@ -261,6 +364,13 @@ class VPNServer:
             listen_port: Port to listen on
             ssh_host: Local SSH server host
             ssh_port: Local SSH server port
+            peer_forwards: {peer name: (host, port)} from `--peer-forward` — see
+                [`parse_peer_forwards`]. A peer named here has its sessions handed
+                to its own socket; a peer that is not keeps today's behaviour and
+                lands on `ssh_host`/`ssh_port`. That mix is deliberate rather than
+                a transitional state: this tunnel is somebody's only way in, so a
+                change that demanded every peer be migrated in one edit would
+                demand it of a live deployment whose operator is on the far side.
 
         Raises:
             ValueError: If the roster is empty at start-up. A server with no
@@ -270,6 +380,10 @@ class VPNServer:
                 from the wrong end. It may legitimately become empty later, by
                 the operator revoking everybody; that is a running server with
                 nobody authorised, which is a different and intended thing.
+            ValueError: If a peer's forward is this server's own listener. That
+                is a session handed straight back into the tunnel, which loops
+                until something runs out — and it is a plausible typo, because
+                the listen port is the one number a peer's config already holds.
         """
         if not roster.current():
             raise ValueError("the roster is empty: no client could ever connect")
@@ -279,6 +393,13 @@ class VPNServer:
         self.listen_port = listen_port
         self.ssh_host = ssh_host
         self.ssh_port = ssh_port
+        self.peer_forwards = dict(peer_forwards) if peer_forwards else {}
+        for name, (host, port) in self.peer_forwards.items():
+            if self._is_own_listener(host, port):
+                raise ValueError(
+                    f"peer '{name}' is forwarded to {host}:{port}, which is this "
+                    "server's own listener: a session handed back into the tunnel"
+                )
         self.server: Optional[asyncio.Server] = None
         self.active_connections = 0
         # Hard ceiling on concurrent connections and an overall wall-clock bound
@@ -290,6 +411,40 @@ class VPNServer:
         self.max_connections = 256
         self.handshake_timeout = 30.0
 
+    # Addresses a wildcard listener answers on. A server bound to 0.0.0.0 or ::
+    # is reachable at every local address, so a "forward" to loopback on the
+    # listen port is the tunnel's own socket under a different name.
+    LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}
+    WILDCARD_HOSTS = {"0.0.0.0", "::", ""}
+
+    def _is_own_listener(self, host: str, port: int) -> bool:
+        """Whether (host, port) names the socket this server accepts on."""
+        if port != self.listen_port:
+            return False
+        if host == self.listen_host:
+            return True
+        return self.listen_host in self.WILDCARD_HOSTS and host in self.LOOPBACK_HOSTS
+
+    def forward_for(self, peer_name: Optional[str]) -> Tuple[str, int]:
+        """
+        Where this peer's session lands.
+
+        The peer's own socket when `--peer-forward` gave them one, and the shared
+        forward otherwise. Falling back is the whole reason a mixed roster works:
+        a deployment that has migrated nobody behaves exactly as it did before
+        this flag existed, and one that has migrated one person changes nothing
+        for anybody else.
+
+        `peer_name` is `None` on the single-peer shape, where the server was
+        started with one key rather than a roster and there is no name to look
+        up; that path is the shared forward by definition.
+        """
+        if peer_name is not None:
+            own = self.peer_forwards.get(peer_name)
+            if own is not None:
+                return own
+        return self.ssh_host, self.ssh_port
+
     async def start(self):
         """Start the VPN server."""
         self.server = await asyncio.start_server(
@@ -297,10 +452,17 @@ class VPNServer:
             self.listen_host,
             self.listen_port
         )
-        
+
         addr = self.server.sockets[0].getsockname()
         print(f"✓ SecureVPN server listening on {addr[0]}:{addr[1]}")
         print(f"✓ Forwarding to SSH server at {self.ssh_host}:{self.ssh_port}")
+        # Per-peer forwards are announced at start-up, one line each, because a
+        # session that lands on the wrong port is a request attributed to the
+        # wrong person — and the only place that mapping can be checked against
+        # what the operator meant is a log written before anybody connects.
+        for name in sorted(self.peer_forwards):
+            host, port = self.peer_forwards[name]
+            print(f"✓ Peer '{name}' is forwarded to {host}:{port}")
         print("✓ Waiting for client connections...\n")
         
         async with self.server:
@@ -344,16 +506,33 @@ class VPNServer:
                 print(f"[{conn_id}] Handshake failed")
                 return
 
-            session_keys, leftover = result
+            session_keys, leftover, peer_name = result
             print(f"[{conn_id}] ✓ Handshake complete, tunnel established")
-            
+
+            # The identity carry: the handshake proved which roster entry this is,
+            # so the forward is chosen by that name rather than being the one
+            # socket every session shared. Nothing new identifies the peer here —
+            # this is the answer CLIENT_AUTH already produced, used instead of
+            # discarded.
+            forward_host, forward_port = self.forward_for(peer_name)
+            own_forward = peer_name is not None and peer_name in self.peer_forwards
+
             # Create SSH connection
             try:
-                ssh_reader, ssh_writer = await asyncio.open_connection(self.ssh_host, self.ssh_port)
-                print(f"[{conn_id}] ✓ Connected to SSH server at {self.ssh_host}:{self.ssh_port}")
+                ssh_reader, ssh_writer = await asyncio.open_connection(forward_host, forward_port)
+                if own_forward:
+                    print(f"[{conn_id}] ✓ Connected to peer '{peer_name}' forward at {forward_host}:{forward_port}")
+                else:
+                    print(f"[{conn_id}] ✓ Connected to SSH server at {forward_host}:{forward_port}")
             except ConnectionRefusedError:
-                print(f"[{conn_id}] ✗ SSH server not available at {self.ssh_host}:{self.ssh_port}")
-                print(f"[{conn_id}]   Enable SSH: System Preferences → Sharing → Remote Login")
+                print(f"[{conn_id}] ✗ SSH server not available at {forward_host}:{forward_port}")
+                if own_forward:
+                    # Naming the peer here is the difference between a five-minute
+                    # fix and an hour: this port exists only to identify them, so
+                    # nothing was listening on it unless somebody set that up.
+                    print(f"[{conn_id}]   Nothing is listening on peer '{peer_name}'s own forward port")
+                else:
+                    print(f"[{conn_id}]   Enable SSH: System Preferences → Sharing → Remote Login")
                 return
             except Exception as e:
                 print(f"[{conn_id}] ✗ Failed to connect to SSH: {e}")
@@ -386,10 +565,15 @@ class VPNServer:
         Perform server-side handshake.
 
         Returns:
-            (SecurityKeys, leftover_bytes) on success, None on failure.
+            (SecurityKeys, leftover_bytes, peer_name) on success, None on failure.
             leftover_bytes are any bytes read past CLIENT_AUTH — the client's
             first DATA packet(s) can arrive coalesced in the same TCP segment,
             and dropping them would strand the first request forever.
+            peer_name is the roster entry this handshake authenticated as, which
+            is what [`VPNServer.forward_for`] turns into a destination socket. It
+            is returned rather than only logged because the caller decides where
+            the session goes, and that decision has to be the same fact the
+            signature proved — not a second, weaker one.
         """
         protocol = SecureVPNProtocol(self.identity, peer_roster=self.roster.current())
         buffer = b""
@@ -441,8 +625,11 @@ class VPNServer:
             if protocol.process_client_auth(packet, state, session_keys):
                 print(f"[{conn_id}] ✓ CLIENT_AUTH verified")
                 # `buffer` now holds anything read past CLIENT_AUTH — hand it to
-                # the tunnel so a coalesced first request is not lost.
-                return session_keys, buffer
+                # the tunnel so a coalesced first request is not lost. The peer
+                # name comes from `state`, which was bound to one roster entry in
+                # CLIENT_HELLO and re-checked against the signature here, so it
+                # cannot name an entry other than the one that authenticated.
+                return session_keys, buffer, state.peer_name
             else:
                 print(f"[{conn_id}] ✗ CLIENT_AUTH verification failed")
                 return None
@@ -558,6 +745,14 @@ async def main():
                              "<name>.pub in the key directory. Defaults to the single peer "
                              "'client', or to SECUREVPN_SERVER_PEER, which may be a "
                              "comma-separated list.")
+    parser.add_argument("--peer-forward", action="append", metavar="NAME=HOST:PORT",
+                        help="Forward THIS peer's sessions to their own socket instead of "
+                             "--ssh-host/--ssh-port: --peer-forward dad=127.0.0.1:9444. "
+                             "Repeat it once per person. The destination port is then what "
+                             "tells the local service which roster entry connected, since "
+                             "every session otherwise arrives from 127.0.0.1 with nothing to "
+                             "tell two people apart. A peer with no mapping is unaffected. "
+                             "Or SECUREVPN_SERVER_PEER_FORWARD, a comma-separated list.")
     parser.add_argument("--roster", metavar="FILE",
                         help="File listing authorised client names, one per line, re-read on "
                              "every handshake so a person can be enrolled without restarting "
@@ -569,7 +764,22 @@ async def main():
 
     if not args.password:
         args.password = os.getenv("SECUREVPN_SERVER_PASSWORD")
-    
+
+    # The identity carry, read first of all. A mapping that does not say what it
+    # means is a person landing on a socket the operator did not intend, and this
+    # is checked before a key is touched or a port is opened so that a typo is
+    # reported as a typo rather than as whatever fails next.
+    try:
+        peer_forwards = parse_peer_forwards(args.peer_forward or [
+            spec.strip()
+            for spec in os.getenv("SECUREVPN_SERVER_PEER_FORWARD", "").split(",")
+            if spec.strip()
+        ])
+    except ValueError as e:
+        print(f"Error: {e}")
+        sys.exit(1)
+
+
     # Load keys
     from pathlib import Path as _Path
     km = KeyManager(_Path(args.key_dir)) if args.key_dir else KeyManager()
@@ -609,15 +819,31 @@ async def main():
         print(f"Error: {e}")
         sys.exit(1)
     
+    # A forward naming somebody the roster does not authorise *yet* is announced
+    # rather than refused: the roster is re-read on every handshake precisely so
+    # that enrolling a person costs no restart, and refusing here would make the
+    # two writes have to happen in an order nobody documented. Silence would be
+    # the wrong answer though — a mistyped name would otherwise leave that peer on
+    # the shared forward while the configuration claimed they had their own.
+    authorised = roster.current()
+    for name in sorted(peer_forwards):
+        if name not in authorised:
+            print(f"peer-forward: '{name}' is not authorised yet; the mapping waits for them")
+
     # Start server
-    server = VPNServer(
-        identity=identity,
-        roster=roster,
-        listen_host=args.host,
-        listen_port=args.port,
-        ssh_host=args.ssh_host,
-        ssh_port=args.ssh_port
-    )
+    try:
+        server = VPNServer(
+            identity=identity,
+            roster=roster,
+            listen_host=args.host,
+            listen_port=args.port,
+            ssh_host=args.ssh_host,
+            ssh_port=args.ssh_port,
+            peer_forwards=peer_forwards
+        )
+    except ValueError as e:
+        print(f"Error: {e}")
+        sys.exit(1)
 
     # Handle graceful shutdown
     loop = asyncio.get_event_loop()
