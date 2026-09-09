@@ -1,19 +1,22 @@
 //! ML-KEM-768 (FIPS 203) implemented from scratch, no pqcrypto/ml-kem/liboqs/kyber crates.
 //!
 //! HONESTY NOTE (read before trusting this for production use):
-//! - This implementation is validated ONLY by internal round-trip self-tests
-//!   (keygen -> encaps -> decaps -> shared secrets match, run 1000+ times) and
-//!   NTT/CBD/compression self-tests. It has NOT been checked against the
-//!   official NIST ACVP Known-Answer-Test (KAT) vectors for ML-KEM-768 --
-//!   that fetch was attempted and is reported separately in the project
-//!   history/commit message, not silently assumed to have passed.
-//! - Matrix generation (XOF domain separation / A vs A^T convention) and PRF
-//!   nonce ordering follow the general K-PKE/ML-KEM structure but have not
-//!   been cross-checked byte-for-byte against the FIPS 203 reference, so this
-//!   is almost certainly NOT interoperable with other ML-KEM-768
-//!   implementations even though it is internally self-consistent and
-//!   mathematically sound (real NTT ring, real CBD noise, real IND-CPA
-//!   structure, real FO-style implicit rejection in Decaps).
+//! - As of 2026-09-09 this implementation is verified against real FIPS 203
+//!   Known-Answer-Test vectors, not just internal round-trip self-tests: the
+//!   NIST ACVP ML-KEM-768 keyGen KAT (tgId=2, tcId=26) matches this crate's
+//!   `keygen_from_seed` byte-for-byte, and a full keygen/encaps/decaps chain
+//!   from that same seed matches an independent second reference
+//!   implementation (`kyber-py`, a pure-Python FIPS 203 implementation)
+//!   byte-for-byte too. See `mlkem768/tests/kat_keygen.rs` and
+//!   `tests/kat_vectors.txt` for the vectors and regression tests.
+//! - Two real bugs were found and fixed to reach that match (see the git
+//!   history for the fixing commit): (1) K-PKE.KeyGen must derive
+//!   `(rho, sigma) = G(d || k)` -- the 32-byte seed with the module rank
+//!   `k` appended as a single byte -- and the code was hashing `d` alone;
+//!   (2) the uniform-matrix XOF seed byte order was backwards between the
+//!   untransposed matrix (`A[i][j] = SampleNTT(XOF(rho, j, i))`) and the
+//!   transposed one used in encryption
+//!   (`A^T[i][j] = SampleNTT(XOF(rho, i, j))`).
 //! - Constant-time posture: CBD sampling and the implicit-rejection
 //!   comparison in `decaps` use no secret-dependent branches and select with
 //!   a computed mask (see `ct_select`/`ct_eq`) rather than early-return.
@@ -381,13 +384,23 @@ fn gen_uniform_poly(rho: &[u8; 32], i: u8, j: u8) -> Poly {
 }
 
 fn gen_matrix(rho: &[u8; 32], transposed: bool) -> Vec<Vec<Poly>> {
+    // FIPS 203 Algorithm 13/14: the untransposed matrix used in KeyGen has
+    // A[i][j] = SampleNTT(XOF(rho, j, i)) -- note the *swapped* (j, i) byte
+    // order into the XOF, not (i, j) -- and the transposed matrix used in
+    // Encrypt has A^T[i][j] = SampleNTT(XOF(rho, i, j)). The previous code
+    // had this backwards (used (i, j) for the untransposed matrix and
+    // (j, i) for the transposed one), which silently produced a
+    // *different* (but still square, still consistent-with-itself) matrix
+    // -- one of the classic Kyber/FIPS-203 mismatch sources, since Encrypt
+    // and KeyGen must derive A the same way from rho for encryption to be
+    // invertible against an interoperable public key.
     let mut a = vec![vec![[0i16; N]; K]; K];
     for i in 0..K {
         for j in 0..K {
             let p = if transposed {
-                gen_uniform_poly(rho, j as u8, i as u8)
-            } else {
                 gen_uniform_poly(rho, i as u8, j as u8)
+            } else {
+                gen_uniform_poly(rho, j as u8, i as u8)
             };
             a[i][j] = p;
         }
@@ -445,7 +458,16 @@ struct IndCpaKeyPair {
 }
 
 fn indcpa_keygen(d: &[u8; 32]) -> IndCpaKeyPair {
-    let (rho, sigma) = g_sha3_512(d);
+    // FIPS 203 Algorithm 13 (K-PKE.KeyGen), step 1: (rho, sigma) = G(d || k),
+    // where k (the module rank, K=3 for ML-KEM-768) is appended to the
+    // 32-byte seed as a single byte before hashing. The previous code
+    // hashed `d` alone, which is a different domain-separation input from
+    // the spec entirely and produced a completely different (rho, sigma)
+    // pair -- the root cause of the ACVP KAT mismatch.
+    let mut d_k = [0u8; 33];
+    d_k[..32].copy_from_slice(d);
+    d_k[32] = K as u8;
+    let (rho, sigma) = g_sha3_512(&d_k);
     let a = gen_matrix(&rho, false);
 
     let mut s = vec![[0i16; N]; K];
@@ -649,18 +671,16 @@ pub fn encaps_with_randomness(pk: &EncapsKey, m: &[u8; 32]) -> (Ciphertext, Shar
     let mut g_input = Vec::with_capacity(64);
     g_input.extend_from_slice(m);
     g_input.extend_from_slice(&h_pk);
-    let (k_bar, coins) = g_sha3_512(&g_input);
+    // FIPS 203 Algorithm 20 (ML-KEM.Encaps): (K, r) = G(m || H(ek)); return
+    // (K, c) directly -- K is NOT re-hashed with H(ciphertext) afterwards.
+    // The earlier code added a spurious `K = KDF(K_bar || H(ct))` step
+    // (that combining step existed in round-3 Kyber but was dropped in the
+    // finalized FIPS 203 standard), which produced a shared secret that
+    // did not match encaps/decaps KATs even after keygen was fixed.
+    let (k, coins) = g_sha3_512(&g_input);
 
     let ct = indcpa_enc(&pk.0, m, &coins);
-    // K = KDF(K_bar || H(ct))
-    let h_ct = h_sha3_256(&ct);
-    let mut kdf_in = Vec::with_capacity(64);
-    kdf_in.extend_from_slice(&k_bar);
-    kdf_in.extend_from_slice(&h_ct);
-    let k = kdf_shake256(&kdf_in, 32);
-    let mut ss = [0u8; 32];
-    ss.copy_from_slice(&k);
-    (Ciphertext(ct), SharedSecret(ss))
+    (Ciphertext(ct), SharedSecret(k))
 }
 
 pub fn decaps(sk: &DecapsKey, ct: &Ciphertext) -> SharedSecret {
@@ -682,6 +702,12 @@ pub fn decaps(sk: &DecapsKey, ct: &Ciphertext) -> SharedSecret {
     // implicit rejection: compare ct and ct' in constant time, select real
     // key material vs. a pseudorandom fallback via a mask, never branching
     // early on the secret-derived comparison result.
+    //
+    // FIPS 203 Algorithm 21 (ML-KEM.Decaps): K' is *directly* the K from
+    // G(m' || h) (`k_bar_prime` here) when c == c', with no further KDF
+    // step -- matching the fix in `encaps_with_randomness` above. Only the
+    // rejection fallback K_bar = J(z || c) goes through a XOF (that's
+    // `j_fallback` below, per spec step 5).
     let matched = ct_eq(&ct.0, &ct_prime);
 
     let mut z_ct = Vec::with_capacity(32 + ct.0.len());
@@ -689,13 +715,7 @@ pub fn decaps(sk: &DecapsKey, ct: &Ciphertext) -> SharedSecret {
     z_ct.extend_from_slice(&ct.0);
     let j_fallback = kdf_shake256(&z_ct, 32);
 
-    let h_ct = h_sha3_256(&ct.0);
-    let mut kdf_in = Vec::with_capacity(64);
-    kdf_in.extend_from_slice(&k_bar_prime);
-    kdf_in.extend_from_slice(&h_ct);
-    let k_real = kdf_shake256(&kdf_in, 32);
-
-    let selected = ct_select(matched, &k_real, &j_fallback);
+    let selected = ct_select(matched, &k_bar_prime, &j_fallback);
     let mut ss = [0u8; 32];
     ss.copy_from_slice(&selected);
     SharedSecret(ss)

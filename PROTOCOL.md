@@ -207,17 +207,23 @@ implementation cannot make v2 worse than v1, only fail to add security).
 
 ### Honest caveats
 
-- **No official interoperability**: this ML-KEM-768 implementation
-  (`mlkem768/`) is verified by internal round-trip self-tests only (see
-  `CRYPTOGRAPHY_EXPLAINED.md`) -- keygen→encaps→decaps produce matching
-  shared secrets across 1000+ trials, NTT/CBD/compression each have their
-  own self-tests. A real NIST ACVP KAT vector for ML-KEM-768 keyGen was
-  fetched live and checked (`mlkem768/tests/kat_keygen.rs`); it does **not**
-  byte-match, because this implementation's internal XOF/PRF domain
-  separation was written for self-consistency, not to reproduce the FIPS
-  203 Appendix pseudocode exactly. Practically: this build only
-  interoperates with itself (client and server both running this same
-  `mlkem768` code), not with other ML-KEM-768 implementations.
+- **Verified against real FIPS 203 KAT vectors (2026-09-09)**: this
+  ML-KEM-768 implementation (`mlkem768/`) is checked against the real NIST
+  ACVP keyGen KAT (tgId=2, tcId=26, fetched live from
+  github.com/usnistgov/ACVP-Server) and matches it byte-for-byte
+  (`mlkem768/tests/kat_keygen.rs`). A full keygen→encaps→decaps chain from
+  that same seed also matches an independent second reference
+  implementation (`kyber-py`, a pure-Python FIPS 203 implementation)
+  byte-for-byte. Two real bugs were found and fixed to reach this: (1)
+  K-PKE.KeyGen must derive `(rho, sigma) = G(d || k)` with the module rank
+  `k` appended to the seed, which the code omitted; (2) the uniform-matrix
+  XOF seed byte order was backwards between the untransposed and
+  transposed matrix generation. In addition to these KATs, the 1000+-trial
+  internal round-trip self-tests and NTT/CBD/compression self-tests
+  described in `CRYPTOGRAPHY_EXPLAINED.md` continue to pass. This is now
+  believed interoperable with other conformant ML-KEM-768 implementations,
+  though full interop has only been checked against one independent
+  Python implementation, not a hardware HSM or another production stack.
 - **Constant-time posture**: CBD sampling and the Fujisaki-Okamoto implicit
   rejection check in `decaps` avoid secret-dependent branches and use a
   computed mask instead of an early return. This has NOT been checked with
