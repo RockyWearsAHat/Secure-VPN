@@ -93,6 +93,102 @@ bob_shared_secret = bob_private.exchange(alice_public)
 
 ---
 
+### ML-KEM-768 (Post-Quantum Key Exchange, protocol v2)
+
+**What it is:** A second, independent way for two people to agree on a secret, designed so that even a future quantum computer breaking X25519 (above) does not break the session. It's a NIST-standardized (FIPS 203) "key encapsulation mechanism" (KEM), not a Diffie-Hellman-style exchange like X25519.
+
+**Why it exists alongside X25519, not instead of it:**
+
+```
+X25519:      mature, decades of cryptanalysis, but a large-enough quantum
+             computer running Shor's algorithm could eventually break it.
+
+ML-KEM-768:  believed quantum-resistant (based on the hardness of lattice
+             problems), but newer and less battle-tested than X25519.
+
+hybrid:      combine BOTH secrets. An attacker has to break BOTH X25519
+             AND ML-KEM-768 to recover the session key -- breaking just
+             one gets them nothing.
+```
+
+**How it works - the "sealed box" analogy** (different shape from X25519's
+color-mixing, because a KEM is asymmetric -- one side generates a key *pair*,
+the other side uses the public half to seal a *fresh* secret for them):
+
+```
+Client generates a keypair: encapsulation key (ek, public) + decapsulation key (dk, secret)
+Client sends ek to the server.
+
+Server picks a random secret, "seals" it using ek:
+    (ciphertext, server_shared_secret) = Encaps(ek)
+Server sends ciphertext back. Nobody but the ek/dk pair's owner can open it.
+
+Client "unseals" the ciphertext with its dk:
+    client_shared_secret = Decaps(dk, ciphertext)
+
+client_shared_secret == server_shared_secret
+An eavesdropper sees ek and ciphertext, but (assuming ML-KEM-768's hardness
+assumption holds) cannot recover the secret from them.
+```
+
+**Real example (this repo's own implementation, `mlkem768/`):**
+
+```python
+import mlkem768
+
+# Client: generate a fresh keypair for this handshake only
+ek, dk = mlkem768.keygen()          # ek: 1184 bytes, dk: 2400 bytes
+
+# ... client sends ek to server in CLIENT_HELLO ...
+
+# Server: seal a fresh secret against the client's public key
+ciphertext, server_secret = mlkem768.encaps(ek)   # ciphertext: 1088 bytes
+
+# ... server sends ciphertext back in SERVER_HELLO ...
+
+# Client: unseal it with the matching secret key
+client_secret = mlkem768.decaps(dk, ciphertext)
+
+# client_secret == server_secret (both 32 bytes) -- verified by 1000+
+# round-trip trials in mlkem768/src/lib.rs's own test suite.
+```
+
+**Combining it with X25519 (the "hybrid secret"):**
+
+```python
+hybrid_secret = x25519_shared_secret + mlkem_shared_secret  # concatenation
+# ... fed into the SAME HKDF chain X25519-only sessions already used ...
+```
+
+**Why hand-rolled, and what that costs:** Common advice is "never write your
+own cryptography" -- and this codebase mostly follows that, building
+X25519/Ed25519/HKDF/ChaCha20-Poly1305 from the well-audited `cryptography`
+library rather than reimplementing elliptic-curve math from scratch. ML-KEM-768
+is the deliberate exception: no mature Python/Rust binding was available to
+lean on here (no `pqcrypto`/`ml-kem`/`liboqs`/`kyber` dependency), so
+`mlkem768/` implements FIPS 203 directly -- NTT, centered binomial sampling,
+compression, the K-PKE primitive, and the encaps/decaps wrapper with
+Fujisaki-Okamoto-style implicit rejection, each piece unit-tested in
+isolation the same way the rest of this codebase's crypto is explained
+piece by piece in this document. The honest cost: a real NIST ACVP
+known-answer-test vector was fetched and checked against this
+implementation's output, and it does **not** byte-match (the internal
+domain-separation choices weren't written to reproduce the FIPS 203
+Appendix exactly) -- so this build is verified correct against *itself*
+(round-trip tests: keygen → encaps → decaps always agree) but not proven
+interoperable with any other ML-KEM-768 implementation. It should be
+treated as "this codebase's own hybrid handshake," not as a drop-in
+replacement people can mix-and-match with other post-quantum TLS stacks.
+
+**Analogy:** X25519 is like two people mixing paint colors and getting the
+same result without revealing their own color. ML-KEM-768 is like one
+person locking a box with a padlock only the *other* person's key can open,
+then mailing the locked box -- a fundamentally different mechanism, chosen
+specifically so a weakness discovered in one mechanism (say, elliptic-curve
+math falling to a quantum computer) doesn't also break the other.
+
+---
+
 ### Ed25519 (Signatures)
 
 **What it is:** A way to prove "I really sent this message" (like a digital signature you can't forge).
@@ -186,6 +282,17 @@ rx_key = HKDF(shared_secret, info=b"server-tx").derive()
 - Never reuse the same key for multiple purposes
 - Can't work backwards from derived keys to find the master secret
 - Standard way to "stretch" one key into many
+
+**Protocol v2 (hybrid):** the *only* thing that changes is what goes into
+`shared_secret` above -- instead of just the X25519 output, it's
+`x25519_secret || mlkem_shared_secret` (see the ML-KEM-768 section above).
+Everything downstream (the `info` labels, the `client-tx`/`server-tx` split,
+zeroing the master key after use) is identical between v1 and v2. That's a
+deliberate design choice: it means a security review of v1's HKDF chain
+carries over to v2 almost unchanged, and it means ML-KEM-768 can only add
+security here, never remove it -- even a hypothetically broken
+`mlkem_shared_secret` (e.g. an attacker who could predict it) still leaves
+the session as strong as v1 was, because `x25519_secret` is still mixed in.
 
 **Analogy:** Like having one master key that you can use to make many different specific keys (mailbox key, garage key, office key), but those specific keys can't be used to recreate the master.
 
