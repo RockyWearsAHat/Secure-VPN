@@ -1,0 +1,13 @@
+[build-system]
+requires = ["maturin>=1.4,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "mlkem768"
+version = "0.1.0"
+description = "From-scratch FIPS 203 ML-KEM-768 (PyO3 bindings), internal round-trip tested, not KAT-verified"
+requires-python = ">=3.8"
+
+[tool.maturin]
+features = ["python"]
+module-name = "mlkem768"

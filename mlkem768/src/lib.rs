@@ -701,6 +701,82 @@ pub fn decaps(sk: &DecapsKey, ct: &Ciphertext) -> SharedSecret {
     SharedSecret(ss)
 }
 
+// ---------------------------------------------------------------------------
+// PyO3 bindings (only compiled with `--features python`, used by maturin to
+// build the `mlkem768` Python extension module).
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "python")]
+mod py_bindings {
+    use super::*;
+    use pyo3::exceptions::PyValueError;
+    use pyo3::prelude::*;
+    use pyo3::types::PyBytes;
+
+    #[pyfunction]
+    #[pyo3(name = "keygen")]
+    fn py_keygen(py: Python<'_>) -> (Py<PyBytes>, Py<PyBytes>) {
+        let (ek, dk) = super::keygen();
+        (
+            PyBytes::new_bound(py, &ek.0).into(),
+            PyBytes::new_bound(py, &dk.0).into(),
+        )
+    }
+
+    #[pyfunction]
+    #[pyo3(name = "encaps")]
+    fn py_encaps(py: Python<'_>, ek: &[u8]) -> PyResult<(Py<PyBytes>, Py<PyBytes>)> {
+        if ek.len() != PUBLICKEY_BYTES {
+            return Err(PyValueError::new_err(format!(
+                "encapsulation key must be {} bytes, got {}",
+                PUBLICKEY_BYTES,
+                ek.len()
+            )));
+        }
+        let ek = EncapsKey(ek.to_vec());
+        let (ct, ss) = super::encaps(&ek);
+        Ok((
+            PyBytes::new_bound(py, &ct.0).into(),
+            PyBytes::new_bound(py, &ss.0).into(),
+        ))
+    }
+
+    #[pyfunction]
+    #[pyo3(name = "decaps")]
+    fn py_decaps(py: Python<'_>, dk: &[u8], ct: &[u8]) -> PyResult<Py<PyBytes>> {
+        if dk.len() != SECRETKEY_BYTES {
+            return Err(PyValueError::new_err(format!(
+                "decapsulation key must be {} bytes, got {}",
+                SECRETKEY_BYTES,
+                dk.len()
+            )));
+        }
+        if ct.len() != CIPHERTEXT_BYTES {
+            return Err(PyValueError::new_err(format!(
+                "ciphertext must be {} bytes, got {}",
+                CIPHERTEXT_BYTES,
+                ct.len()
+            )));
+        }
+        let dk = DecapsKey(dk.to_vec());
+        let ct = Ciphertext(ct.to_vec());
+        let ss = super::decaps(&dk, &ct);
+        Ok(PyBytes::new_bound(py, &ss.0).into())
+    }
+
+    #[pymodule]
+    fn mlkem768(m: &Bound<'_, PyModule>) -> PyResult<()> {
+        m.add_function(wrap_pyfunction!(py_keygen, m)?)?;
+        m.add_function(wrap_pyfunction!(py_encaps, m)?)?;
+        m.add_function(wrap_pyfunction!(py_decaps, m)?)?;
+        m.add("PUBLICKEY_BYTES", PUBLICKEY_BYTES)?;
+        m.add("SECRETKEY_BYTES", SECRETKEY_BYTES)?;
+        m.add("CIPHERTEXT_BYTES", CIPHERTEXT_BYTES)?;
+        m.add("SHARED_SECRET_BYTES", SHARED_SECRET_BYTES)?;
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
