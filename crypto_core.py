@@ -273,18 +273,34 @@ class KeyExchange:
         except Exception as e:
             raise CryptoException(f"Key exchange failed: {e}")
     
-    def derive_session_keys(self, shared_secret: bytes, is_client: bool) -> SecurityKeys:
+    def derive_session_keys(
+        self,
+        shared_secret: bytes,
+        is_client: bool,
+        mlkem_shared_secret: Optional[bytes] = None,
+    ) -> SecurityKeys:
         """
         Derive session keys from shared secret using HKDF.
-        
+
         Args:
-            shared_secret: 32-byte shared secret from ECDH
+            shared_secret: 32-byte shared secret from X25519 ECDH
             is_client: True if this is the client side
-            
+            mlkem_shared_secret: When present (protocol v2 hybrid handshake),
+                the 32-byte ML-KEM-768 shared secret, concatenated after the
+                X25519 secret before the HKDF extract. This is the ONLY thing
+                that changes between v1 and v2 key derivation -- the info
+                labels/domain separation below (b"SecureVPN-v1",
+                b"client-tx"/b"server-tx") are unchanged, so a v1 handshake
+                (mlkem_shared_secret=None) derives byte-identical keys to
+                before this change.
+
         Returns:
             SecurityKeys with tx_key and rx_key
         """
-        # Extract phase: derive master key from shared secret
+        # Extract phase: derive master key from shared secret. v2 (hybrid)
+        # feeds X25519 || ML-KEM-768 combined secret material into the same
+        # extract step; v1 (classical-only) is unchanged.
+        input_secret = shared_secret if mlkem_shared_secret is None else shared_secret + mlkem_shared_secret
         hkdf_extract = HKDF(
             algorithm=hashes.SHA256(),
             length=32,
@@ -292,7 +308,7 @@ class KeyExchange:
             info=b"SecureVPN-v1",
             backend=default_backend()
         )
-        master_key = hkdf_extract.derive(shared_secret)
+        master_key = hkdf_extract.derive(input_secret)
         
         # Expand phase: derive separate keys for each direction
         hkdf_tx = HKDF(
