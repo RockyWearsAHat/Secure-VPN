@@ -138,13 +138,18 @@ class TestRoster(unittest.TestCase):
         import time
         from crypto_core import KeyExchange
 
+        import mlkem768
+        from protocol import MLKEM_PUBLICKEY_BYTES
+
         kex = KeyExchange()
         timestamp = time.time()
+        mlkem_ek, _mlkem_dk = mlkem768.keygen()
         hello = struct.pack(
-            '<BBd32s32s',
-            0x01, 1, timestamp,
+            f'<BBd32s32s{MLKEM_PUBLICKEY_BYTES}s',
+            0x01, 2, timestamp,
             kex.get_public_bytes(),
             self.dad.get_public_bytes(),
+            mlkem_ek,
         )
 
         server_hello, server_state, server_keys = server.process_client_hello(hello)
@@ -159,7 +164,9 @@ class TestRoster(unittest.TestCase):
         )
         forged = struct.pack('<B32s64s', 0x03, self.dad.get_public_bytes(), impostor.sign(sign_msg))
         shared = kex.derive_shared_secret(server_state.ephemeral_exchange.get_public_bytes())
-        client_keys = kex.derive_session_keys(shared, is_client=True)
+        client_keys = kex.derive_session_keys(
+            shared, is_client=True, mlkem_shared_secret=server_state.mlkem_shared_secret
+        )
 
         with self.assertRaises(ProtocolError) as refusal:
             server.process_client_auth(client_keys.encrypt(forged), server_state, server_keys)

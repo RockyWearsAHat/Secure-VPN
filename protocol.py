@@ -16,6 +16,25 @@ from crypto_core import (
     validate_timestamp, secure_random
 )
 
+# ML-KEM-768 is optional: only required to actually run a v2 (hybrid)
+# handshake. It is imported lazily inside the v2 code paths so that a v1-only
+# deployment (or a checkout where the mlkem768 extension hasn't been built)
+# is unaffected -- importing protocol.py must not fail just because nobody
+# built mlkem768 yet.
+try:
+    import mlkem768  # type: ignore
+    _MLKEM_AVAILABLE = True
+except ImportError:
+    mlkem768 = None  # type: ignore
+    _MLKEM_AVAILABLE = False
+
+# ML-KEM-768 sizes (FIPS 203 / this repo's mlkem768 crate). Hardcoded here
+# (rather than only read off the module) so v2 struct layouts can be defined
+# even before mlkem768 is imported/available.
+MLKEM_PUBLICKEY_BYTES = 1184
+MLKEM_CIPHERTEXT_BYTES = 1088
+MLKEM_SHARED_SECRET_BYTES = 32
+
 
 class PacketType(IntEnum):
     """Protocol packet types"""
@@ -45,6 +64,12 @@ class HandshakeState:
     # Which roster entry this handshake resolved to, for the log line and for
     # revocation. None on the client side, where there is only ever one peer.
     peer_name: Optional[str] = None
+    # Protocol v2 (hybrid X25519+ML-KEM-768) fields. All None for a v1
+    # handshake -- their presence/absence is exactly what
+    # SecurityKeys/derive_session_keys uses to decide whether to fold an
+    # ML-KEM shared secret into the HKDF chain.
+    mlkem_decaps_key: Optional[bytes] = None  # client only: dk, kept until decaps
+    mlkem_shared_secret: Optional[bytes] = None
 
 
 class SecureVPNProtocol:
@@ -58,7 +83,14 @@ class SecureVPNProtocol:
     - Protocol state machine
     """
     
-    PROTOCOL_VERSION = 1
+    # Bumped from 1 to 2 additively: v1's wire format and key derivation are
+    # untouched and their parsing code is kept intact below (see the
+    # `_v1` methods) -- v2 adds a hybrid X25519+ML-KEM-768 handshake on top.
+    # A handler always speaks exactly one version (no negotiation); a peer
+    # tagging a packet with any other version is rejected with ProtocolError
+    # before any version-specific struct.unpack is attempted, so a version
+    # mismatch can never turn into a silent misparse or a struct.error crash.
+    PROTOCOL_VERSION = 2
     MAX_TIMESTAMP_SKEW = 300.0  # 5 minutes
     MAX_PACKET_SIZE = 65535
     
@@ -131,92 +163,201 @@ class SecureVPNProtocol:
     def create_client_hello(self) -> Tuple[bytes, HandshakeState]:
         """
         Create CLIENT_HELLO packet (step 1 of handshake).
-        
+
+        v2 (default, hybrid): also generates an ML-KEM-768 keypair and
+        includes the 1184-byte encapsulation key in the packet; the matching
+        decapsulation key is kept in the returned HandshakeState until
+        process_server_hello() decapsulates the server's response.
+
         Returns:
             (packet_bytes, handshake_state)
         """
-        # Generate ephemeral key for this session
+        if self.PROTOCOL_VERSION == 1:
+            return self._create_client_hello_v1()
+        elif self.PROTOCOL_VERSION == 2:
+            return self._create_client_hello_v2()
+        raise ProtocolError(f"Unsupported protocol version: {self.PROTOCOL_VERSION}")
+
+    def _create_client_hello_v1(self) -> Tuple[bytes, HandshakeState]:
+        """Legacy v1 CLIENT_HELLO -- X25519-only, kept intact unchanged."""
         kex = KeyExchange()
         timestamp = time.time()
-        
-        # Build packet: [type(1)] [version(1)] [timestamp(8)] [ephemeral_pub(32)] [identity_pub(32)]
+
+        # [type(1)] [version(1)] [timestamp(8)] [ephemeral_pub(32)] [identity_pub(32)]
         packet = struct.pack(
             '<BBd32s32s',
             PacketType.CLIENT_HELLO,
-            self.PROTOCOL_VERSION,
+            1,
             timestamp,
             kex.get_public_bytes(),
             self.identity.get_public_bytes()
         )
-        
+
         state = HandshakeState(
             identity=self.identity,
             peer_identity_pubkey=self.peer_identity_pubkey,
             ephemeral_exchange=kex,
             client_timestamp=timestamp
         )
-        
+
         return packet, state
-    
+
+    def _create_client_hello_v2(self) -> Tuple[bytes, HandshakeState]:
+        """v2 CLIENT_HELLO -- adds the ML-KEM-768 encapsulation key."""
+        if not _MLKEM_AVAILABLE:
+            raise ProtocolError(
+                "protocol v2 requires the mlkem768 extension module, which is not importable "
+                "(build it with maturin, see mlkem768/README/pyproject.toml)"
+            )
+        kex = KeyExchange()
+        timestamp = time.time()
+        mlkem_ek, mlkem_dk = mlkem768.keygen()
+        if len(mlkem_ek) != MLKEM_PUBLICKEY_BYTES:
+            raise ProtocolError(f"ML-KEM ek has unexpected length {len(mlkem_ek)}")
+
+        # [type(1)] [version(1)] [timestamp(8)] [ephemeral_pub(32)] [identity_pub(32)] [mlkem_ek(1184)]
+        packet = struct.pack(
+            '<BBd32s32s1184s',
+            PacketType.CLIENT_HELLO,
+            2,
+            timestamp,
+            kex.get_public_bytes(),
+            self.identity.get_public_bytes(),
+            mlkem_ek
+        )
+
+        state = HandshakeState(
+            identity=self.identity,
+            peer_identity_pubkey=self.peer_identity_pubkey,
+            ephemeral_exchange=kex,
+            client_timestamp=timestamp,
+            mlkem_decaps_key=mlkem_dk
+        )
+
+        return packet, state
+
     def process_server_hello(self, packet: bytes, state: HandshakeState) -> SecurityKeys:
         """
         Process SERVER_HELLO packet (step 2 of handshake).
-        
+
+        The wire version is read from the packet's own version byte (peeking
+        only [type,version] before choosing a struct format) so a
+        wrong-version packet is rejected with ProtocolError instead of being
+        unpacked with the wrong struct layout (which would either raise a
+        raw struct.error or, worse, silently parse garbage).
+
         Args:
             packet: SERVER_HELLO packet bytes
             state: Handshake state from create_client_hello
-            
+
         Returns:
             SecurityKeys for the session
-            
+
         Raises:
-            ProtocolError: On invalid packet or failed verification
+            ProtocolError: On invalid packet, version mismatch, or failed verification
         """
+        if len(packet) < 2:
+            raise ProtocolError("SERVER_HELLO packet too short to contain a version")
+        _peek_type, version = struct.unpack('<BB', packet[:2])
+
+        if version != self.PROTOCOL_VERSION:
+            raise ProtocolError(f"Protocol version mismatch: {version} != {self.PROTOCOL_VERSION}")
+
+        if version == 1:
+            return self._process_server_hello_v1(packet, state)
+        elif version == 2:
+            return self._process_server_hello_v2(packet, state)
+        raise ProtocolError(f"Unsupported protocol version: {version}")
+
+    def _process_server_hello_v1(self, packet: bytes, state: HandshakeState) -> SecurityKeys:
+        """Legacy v1 SERVER_HELLO parsing -- X25519-only, kept intact unchanged."""
         if len(packet) < 138:  # 1+1+8+32+32+64 minimum
             raise ProtocolError("SERVER_HELLO packet too short")
-        
-        # Parse packet: [type(1)] [version(1)] [timestamp(8)] [ephemeral_pub(32)] [identity_pub(32)] [signature(64)]
+
         pkt_type, version, server_time, server_eph_pub, server_id_pub, signature = struct.unpack(
             '<BBd32s32s64s',
             packet[:138]
         )
-        
+
         if pkt_type != PacketType.SERVER_HELLO:
             raise ProtocolError(f"Expected SERVER_HELLO, got {pkt_type}")
-        
-        if version != self.PROTOCOL_VERSION:
-            raise ProtocolError(f"Protocol version mismatch: {version} != {self.PROTOCOL_VERSION}")
-        
-        # Validate timestamp
+
         if not validate_timestamp(server_time, self.MAX_TIMESTAMP_SKEW):
             raise ProtocolError("Server timestamp out of acceptable range")
-        
-        # Verify server identity matches expected
+
         if server_id_pub != self.peer_identity_pubkey:
             raise ProtocolError("Server identity key mismatch")
-        
-        # Verify signature over handshake transcript
-        # Sign: client_eph_pub || server_eph_pub || client_time || server_time
+
         sign_msg = (
             state.ephemeral_exchange.get_public_bytes() +
             server_eph_pub +
             struct.pack('<d', state.client_timestamp) +
             struct.pack('<d', server_time)
         )
-        
+
         if not IdentityKeys.verify_signature(server_id_pub, sign_msg, signature):
             raise ProtocolError("Server signature verification failed")
-        
-        # Perform ECDH key exchange
+
         shared_secret = state.ephemeral_exchange.derive_shared_secret(server_eph_pub)
-        
-        # Derive session keys (we are client)
         session_keys = state.ephemeral_exchange.derive_session_keys(shared_secret, is_client=True)
-        
-        # Update state
+
         state.peer_ephemeral_pubkey = server_eph_pub
         state.server_timestamp = server_time
-        
+
+        return session_keys
+
+    def _process_server_hello_v2(self, packet: bytes, state: HandshakeState) -> SecurityKeys:
+        """v2 SERVER_HELLO parsing -- adds the ML-KEM-768 ciphertext, whose
+        bytes are bound into the signed transcript alongside the ephemeral
+        X25519 keys and timestamps."""
+        if not _MLKEM_AVAILABLE:
+            raise ProtocolError(
+                "protocol v2 requires the mlkem768 extension module, which is not importable"
+            )
+        expected_len = 1 + 1 + 8 + 32 + 32 + MLKEM_CIPHERTEXT_BYTES + 64  # 1226
+        if len(packet) < expected_len:
+            raise ProtocolError("SERVER_HELLO (v2) packet too short")
+
+        pkt_type, version, server_time, server_eph_pub, server_id_pub, mlkem_ct, signature = struct.unpack(
+            f'<BBd32s32s{MLKEM_CIPHERTEXT_BYTES}s64s',
+            packet[:expected_len]
+        )
+
+        if pkt_type != PacketType.SERVER_HELLO:
+            raise ProtocolError(f"Expected SERVER_HELLO, got {pkt_type}")
+
+        if not validate_timestamp(server_time, self.MAX_TIMESTAMP_SKEW):
+            raise ProtocolError("Server timestamp out of acceptable range")
+
+        if server_id_pub != self.peer_identity_pubkey:
+            raise ProtocolError("Server identity key mismatch")
+
+        # Sign: client_eph_pub || server_eph_pub || client_time || server_time || mlkem_ct
+        sign_msg = (
+            state.ephemeral_exchange.get_public_bytes() +
+            server_eph_pub +
+            struct.pack('<d', state.client_timestamp) +
+            struct.pack('<d', server_time) +
+            mlkem_ct
+        )
+
+        if not IdentityKeys.verify_signature(server_id_pub, sign_msg, signature):
+            raise ProtocolError("Server signature verification failed")
+
+        if state.mlkem_decaps_key is None:
+            raise ProtocolError("Handshake state missing ML-KEM decapsulation key")
+
+        shared_secret = state.ephemeral_exchange.derive_shared_secret(server_eph_pub)
+        mlkem_shared_secret = mlkem768.decaps(state.mlkem_decaps_key, mlkem_ct)
+
+        session_keys = state.ephemeral_exchange.derive_session_keys(
+            shared_secret, is_client=True, mlkem_shared_secret=mlkem_shared_secret
+        )
+
+        state.peer_ephemeral_pubkey = server_eph_pub
+        state.server_timestamp = server_time
+        state.mlkem_shared_secret = mlkem_shared_secret
+
         return session_keys
     
     def create_client_auth(self, state: HandshakeState, session_keys: SecurityKeys) -> bytes:
@@ -257,53 +398,59 @@ class SecureVPNProtocol:
     def process_client_hello(self, packet: bytes) -> Tuple[bytes, HandshakeState, SecurityKeys]:
         """
         Process CLIENT_HELLO and create SERVER_HELLO response (server-side).
-        
+
+        Dispatches on the packet's own version byte (peeked before any
+        version-specific struct.unpack) so a version this handler does not
+        speak is rejected with ProtocolError rather than misparsed.
+
         Args:
             packet: CLIENT_HELLO packet bytes
-            
+
         Returns:
             (server_hello_packet, handshake_state, session_keys)
-            
+
         Raises:
-            ProtocolError: On invalid packet
+            ProtocolError: On invalid packet or version mismatch
         """
+        if len(packet) < 2:
+            raise ProtocolError("CLIENT_HELLO packet too short to contain a version")
+        _peek_type, version = struct.unpack('<BB', packet[:2])
+
+        if version != self.PROTOCOL_VERSION:
+            raise ProtocolError(f"Protocol version mismatch: {version} != {self.PROTOCOL_VERSION}")
+
+        if version == 1:
+            return self._process_client_hello_v1(packet)
+        elif version == 2:
+            return self._process_client_hello_v2(packet)
+        raise ProtocolError(f"Unsupported protocol version: {version}")
+
+    def _process_client_hello_v1(self, packet: bytes) -> Tuple[bytes, HandshakeState, SecurityKeys]:
+        """Legacy v1 CLIENT_HELLO handling -- X25519-only, kept intact unchanged."""
         if len(packet) != 74:  # 1+1+8+32+32
             raise ProtocolError("CLIENT_HELLO packet invalid length")
-        
-        # Parse packet
+
         pkt_type, version, client_time, client_eph_pub, client_id_pub = struct.unpack(
             '<BBd32s32s',
             packet
         )
-        
+
         if pkt_type != PacketType.CLIENT_HELLO:
             raise ProtocolError(f"Expected CLIENT_HELLO, got {pkt_type}")
-        
-        if version != self.PROTOCOL_VERSION:
-            raise ProtocolError(f"Protocol version mismatch: {version}")
-        
-        # Validate timestamp
+
         if not validate_timestamp(client_time, self.MAX_TIMESTAMP_SKEW):
             raise ProtocolError("Client timestamp out of acceptable range")
-        
-        # Select the authorised peer this key belongs to. With one peer
-        # configured this is the same comparison it always was; with a roster it
-        # is a lookup, and a key nobody holds fails here with the same message.
+
         peer_name, expected_pubkey = self._resolve_peer(client_id_pub)
         if expected_pubkey is None:
             raise ProtocolError("Client identity key mismatch")
 
-        # Generate our ephemeral key
         kex = KeyExchange()
         server_time = time.time()
-        
-        # Perform ECDH
+
         shared_secret = kex.derive_shared_secret(client_eph_pub)
-        
-        # Derive session keys (we are server)
         session_keys = kex.derive_session_keys(shared_secret, is_client=False)
-        
-        # Create signature over handshake
+
         sign_msg = (
             client_eph_pub +
             kex.get_public_bytes() +
@@ -311,29 +458,96 @@ class SecureVPNProtocol:
             struct.pack('<d', server_time)
         )
         signature = self.identity.sign(sign_msg)
-        
-        # Build SERVER_HELLO
+
         server_hello = struct.pack(
             '<BBd32s32s64s',
             PacketType.SERVER_HELLO,
-            self.PROTOCOL_VERSION,
+            1,
             server_time,
             kex.get_public_bytes(),
             self.identity.get_public_bytes(),
             signature
         )
-        
+
         state = HandshakeState(
             identity=self.identity,
-            # The resolved key, not the handler's — from here on this handshake
-            # is bound to exactly one peer, so CLIENT_AUTH cannot be answered by
-            # a different roster entry than CLIENT_HELLO claimed to be.
             peer_identity_pubkey=expected_pubkey,
             ephemeral_exchange=kex,
             peer_ephemeral_pubkey=client_eph_pub,
             client_timestamp=client_time,
             server_timestamp=server_time,
             peer_name=peer_name
+        )
+
+        return server_hello, state, session_keys
+
+    def _process_client_hello_v2(self, packet: bytes) -> Tuple[bytes, HandshakeState, SecurityKeys]:
+        """v2 CLIENT_HELLO handling -- adds ML-KEM-768 encapsulation against
+        the client's ek, binding the resulting ciphertext into the server's
+        signed transcript."""
+        if not _MLKEM_AVAILABLE:
+            raise ProtocolError(
+                "protocol v2 requires the mlkem768 extension module, which is not importable"
+            )
+        expected_len = 1 + 1 + 8 + 32 + 32 + MLKEM_PUBLICKEY_BYTES  # 1258
+        if len(packet) != expected_len:
+            raise ProtocolError("CLIENT_HELLO (v2) packet invalid length")
+
+        pkt_type, version, client_time, client_eph_pub, client_id_pub, mlkem_ek = struct.unpack(
+            f'<BBd32s32s{MLKEM_PUBLICKEY_BYTES}s',
+            packet
+        )
+
+        if pkt_type != PacketType.CLIENT_HELLO:
+            raise ProtocolError(f"Expected CLIENT_HELLO, got {pkt_type}")
+
+        if not validate_timestamp(client_time, self.MAX_TIMESTAMP_SKEW):
+            raise ProtocolError("Client timestamp out of acceptable range")
+
+        peer_name, expected_pubkey = self._resolve_peer(client_id_pub)
+        if expected_pubkey is None:
+            raise ProtocolError("Client identity key mismatch")
+
+        kex = KeyExchange()
+        server_time = time.time()
+
+        shared_secret = kex.derive_shared_secret(client_eph_pub)
+        mlkem_ct, mlkem_shared_secret = mlkem768.encaps(mlkem_ek)
+
+        session_keys = kex.derive_session_keys(
+            shared_secret, is_client=False, mlkem_shared_secret=mlkem_shared_secret
+        )
+
+        # Sign: client_eph_pub || server_eph_pub || client_time || server_time || mlkem_ct
+        sign_msg = (
+            client_eph_pub +
+            kex.get_public_bytes() +
+            struct.pack('<d', client_time) +
+            struct.pack('<d', server_time) +
+            mlkem_ct
+        )
+        signature = self.identity.sign(sign_msg)
+
+        server_hello = struct.pack(
+            f'<BBd32s32s{MLKEM_CIPHERTEXT_BYTES}s64s',
+            PacketType.SERVER_HELLO,
+            2,
+            server_time,
+            kex.get_public_bytes(),
+            self.identity.get_public_bytes(),
+            mlkem_ct,
+            signature
+        )
+
+        state = HandshakeState(
+            identity=self.identity,
+            peer_identity_pubkey=expected_pubkey,
+            ephemeral_exchange=kex,
+            peer_ephemeral_pubkey=client_eph_pub,
+            client_timestamp=client_time,
+            server_timestamp=server_time,
+            peer_name=peer_name,
+            mlkem_shared_secret=mlkem_shared_secret
         )
 
         return server_hello, state, session_keys

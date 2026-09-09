@@ -1,1 +1,9 @@
 cryptography>=42.0.0
+
+# Protocol v2 (hybrid X25519 + ML-KEM-768 handshake) needs the local
+# mlkem768 PyO3 extension module. It is not on PyPI -- build it from
+# mlkem768/ with maturin and install the wheel, e.g.:
+#   pip install maturin
+#   maturin build --release --manifest-path mlkem768/Cargo.toml -o mlkem768/dist
+#   pip install mlkem768/dist/mlkem768-*.whl
+# protocol.py imports it lazily: v1-only usage does not require it.
