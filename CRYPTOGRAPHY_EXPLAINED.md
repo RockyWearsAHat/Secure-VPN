@@ -170,15 +170,17 @@ lean on here (no `pqcrypto`/`ml-kem`/`liboqs`/`kyber` dependency), so
 compression, the K-PKE primitive, and the encaps/decaps wrapper with
 Fujisaki-Okamoto-style implicit rejection, each piece unit-tested in
 isolation the same way the rest of this codebase's crypto is explained
-piece by piece in this document. The honest cost: a real NIST ACVP
-known-answer-test vector was fetched and checked against this
-implementation's output, and it does **not** byte-match (the internal
-domain-separation choices weren't written to reproduce the FIPS 203
-Appendix exactly) -- so this build is verified correct against *itself*
-(round-trip tests: keygen → encaps → decaps always agree) but not proven
-interoperable with any other ML-KEM-768 implementation. It should be
-treated as "this codebase's own hybrid handshake," not as a drop-in
-replacement people can mix-and-match with other post-quantum TLS stacks.
+piece by piece in this document. As of 2026-09-09, a real NIST ACVP
+known-answer-test vector (ML-KEM-768 keyGen, tgId=2, tcId=26) has been
+fetched and checked against this implementation's output, and it now
+**matches byte-for-byte** -- two bugs in the seed expansion (`G(d)` instead
+of the spec's `G(d || k)`) and the uniform-matrix XOF byte order (untransposed
+vs. transposed generation had the seed order swapped) were found and fixed
+to get there. A full keygen→encaps→decaps chain from the same seed also
+matches an independent second reference implementation (`kyber-py`) byte-
+for-byte. Round-trip self-tests (keygen → encaps → decaps always agree,
+1000+ trials) still pass too. See `mlkem768/tests/kat_keygen.rs` and
+`PROTOCOL.md`'s "Honest caveats" section for the vectors and the fix.
 
 **Analogy:** X25519 is like two people mixing paint colors and getting the
 same result without revealing their own color. ML-KEM-768 is like one
