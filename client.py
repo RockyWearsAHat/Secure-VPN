@@ -51,6 +51,9 @@ class VPNClient:
         self.vpn_reader: Optional[asyncio.StreamReader] = None
         self.vpn_writer: Optional[asyncio.StreamWriter] = None
         self.local_server: Optional[asyncio.Server] = None
+        self.total_tx = 0
+        self.total_rx = 0
+        self._stats_task: Optional[asyncio.Task] = None
     
     async def connect(self):
         """Verify the server is reachable and authentic, then serve locally.
@@ -158,7 +161,9 @@ class VPNClient:
         print(f"\n✓ Local SSH proxy listening on {self.local_host}:{self.local_port}")
         print(f"✓ Connect with: ssh -p {self.local_port} user@{self.local_host}")
         print("✓ VPN tunnel active\n")
-        
+
+        self._stats_task = asyncio.create_task(self._report_live_stats())
+
         async with self.local_server:
             await self.local_server.serve_forever()
     
@@ -208,7 +213,8 @@ class VPNClient:
                         encrypted = protocol.create_data_packet(data, session_keys)
                         framed = frame_packet(encrypted)
                         bytes_tx += len(data)
-                        
+                        self.total_tx += len(data)
+
                         vpn_writer.write(framed)
                         await vpn_writer.drain()
                 
@@ -239,7 +245,8 @@ class VPNClient:
                             # Decrypt packet
                             payload = protocol.parse_data_packet(packet, session_keys)
                             bytes_rx += len(payload)
-                            
+                            self.total_rx += len(payload)
+
                             # Forward to local SSH client
                             local_writer.write(payload)
                             await local_writer.drain()
@@ -266,9 +273,25 @@ class VPNClient:
             except Exception:
                 pass
             print(f"[{conn_id}] Connection closed (TX: {bytes_tx} bytes, RX: {bytes_rx} bytes)")
-    
+
+    async def _report_live_stats(self):
+        """Prints a running grand total of bytes transferred across every
+        connection, every two seconds, so a UI watching this process's
+        stdout can show live throughput instead of only learning totals
+        when a connection closes (which, for one long-lived tunneled SSH
+        session, could be the entire length of the VPN connection)."""
+        try:
+            while True:
+                await asyncio.sleep(2)
+                print(f"LIVE_STATS TX_TOTAL={self.total_tx} RX_TOTAL={self.total_rx}")
+        except asyncio.CancelledError:
+            pass
+
     async def disconnect(self):
         """Disconnect from VPN server."""
+        if self._stats_task is not None:
+            self._stats_task.cancel()
+
         if self.vpn_writer:
             try:
                 self.vpn_writer.close()
