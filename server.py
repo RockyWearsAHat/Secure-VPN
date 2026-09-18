@@ -18,6 +18,7 @@ from crypto_core import IdentityKeys, SecurityKeys, CryptoException
 from protocol import SecureVPNProtocol, ProtocolError, frame_packet, parse_framed_packet
 from key_manager import KeyManager
 from config import load_env
+from account_manager import init_account_manager, shutdown_account_manager, validate_vpn_user
 
 
 class SSHServiceManager(AbstractContextManager["SSHServiceManager"]):
@@ -440,9 +441,21 @@ class VPNServer:
             # Verify CLIENT_AUTH
             if protocol.process_client_auth(packet, state, session_keys):
                 print(f"[{conn_id}] ✓ CLIENT_AUTH verified")
-                # `buffer` now holds anything read past CLIENT_AUTH — hand it to
-                # the tunnel so a coalesced first request is not lost.
-                return session_keys, buffer
+
+                # Validate user against account-manager
+                user_id = state.peer_name
+                client_ip = writer.get_extra_info('peername')[0] if writer.get_extra_info('peername') else 'unknown'
+
+                validation = await validate_vpn_user(user_id, client_ip)
+
+                if validation.get('valid'):
+                    print(f"[{conn_id}] ✓ User '{user_id}' validated by account-manager")
+                    # `buffer` now holds anything read past CLIENT_AUTH — hand it to
+                    # the tunnel so a coalesced first request is not lost.
+                    return session_keys, buffer
+                else:
+                    print(f"[{conn_id}] ✗ User '{user_id}' denied by account-manager: {validation.get('reason')}")
+                    return None
             else:
                 print(f"[{conn_id}] ✗ CLIENT_AUTH verification failed")
                 return None
@@ -565,6 +578,8 @@ async def main():
     parser.add_argument("--password", help="Password for encrypted identity key")
     parser.add_argument("--key-dir", default=os.getenv("SECUREVPN_KEY_DIR"),
                         help="Directory holding identity/peer keys (default: ~/.securevpn/keys)")
+    parser.add_argument("--account-manager", default=os.getenv("SECUREVPN_ACCOUNT_MANAGER", "http://127.0.0.1:9000"),
+                        help="Account manager URL (default: http://127.0.0.1:9000)")
     args = parser.parse_args()
 
     if not args.password:
@@ -635,6 +650,10 @@ async def main():
             pass
 
     try:
+        # Initialize account manager
+        await init_account_manager(args.account_manager)
+        print(f"✓ Account manager connected at {args.account_manager}\n")
+
         with SSHServiceManager(args.ssh_host, args.ssh_port):
             await server.start()
     except KeyboardInterrupt:
@@ -642,6 +661,8 @@ async def main():
     except Exception as e:
         print(f"Server error: {e}")
         sys.exit(1)
+    finally:
+        await shutdown_account_manager()
 
 
 if __name__ == "__main__":
