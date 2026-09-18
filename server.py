@@ -246,7 +246,8 @@ class VPNServer:
         listen_host: str = "0.0.0.0",
         listen_port: int = 8443,
         ssh_host: str = "127.0.0.1",
-        ssh_port: int = 22
+        ssh_port: int = 22,
+        location: str = "console",
     ):
         """
         Initialize VPN server.
@@ -262,6 +263,11 @@ class VPNServer:
             listen_port: Port to listen on
             ssh_host: Local SSH server host
             ssh_port: Local SSH server port
+            location: Which VPN location this instance answers to when it
+                asks the account-manager. One relay process is one location
+                (`console`, `ssh`, ...); a peer authorised on the tunnel
+                still needs `vpn.access:<location>` granted on the admin
+                side for *this* location specifically.
 
         Raises:
             ValueError: If the roster is empty at start-up. A server with no
@@ -280,6 +286,7 @@ class VPNServer:
         self.listen_port = listen_port
         self.ssh_host = ssh_host
         self.ssh_port = ssh_port
+        self.location = location
         self.server: Optional[asyncio.Server] = None
         self.active_connections = 0
         # Hard ceiling on concurrent connections and an overall wall-clock bound
@@ -446,7 +453,7 @@ class VPNServer:
                 user_id = state.peer_name
                 client_ip = writer.get_extra_info('peername')[0] if writer.get_extra_info('peername') else 'unknown'
 
-                validation = await validate_vpn_user(user_id, client_ip)
+                validation = await validate_vpn_user(user_id, self.location, client_ip)
 
                 if validation.get('valid'):
                     print(f"[{conn_id}] ✓ User '{user_id}' validated by account-manager")
@@ -578,8 +585,17 @@ async def main():
     parser.add_argument("--password", help="Password for encrypted identity key")
     parser.add_argument("--key-dir", default=os.getenv("SECUREVPN_KEY_DIR"),
                         help="Directory holding identity/peer keys (default: ~/.securevpn/keys)")
-    parser.add_argument("--account-manager", default=os.getenv("SECUREVPN_ACCOUNT_MANAGER", "http://127.0.0.1:9000"),
-                        help="Account manager URL (default: http://127.0.0.1:9000)")
+    parser.add_argument("--account-manager", default=os.getenv("SECUREVPN_ACCOUNT_MANAGER", "http://127.0.0.1:9191"),
+                        help="Base URL of the selfhost admin API's loopback listener, which "
+                             "answers whether a peer may use this location (default: "
+                             "http://127.0.0.1:9191, i.e. server.admin_bind)")
+    parser.add_argument("--account-manager-token-file", default=os.getenv("SECUREVPN_ACCOUNT_MANAGER_TOKEN_FILE"),
+                        help="Path to the deployment's admin bearer token (<data_dir>/admin.token). "
+                             "A path, never the secret itself, on the command line — the same "
+                             "posture --key-dir already has.")
+    parser.add_argument("--location", default=os.getenv("SECUREVPN_LOCATION", "console"),
+                        help="Which VPN location this relay is, for the vpn.access:<location> "
+                             "grant the admin API checks (default: console)")
     args = parser.parse_args()
 
     if not args.password:
@@ -631,7 +647,8 @@ async def main():
         listen_host=args.host,
         listen_port=args.port,
         ssh_host=args.ssh_host,
-        ssh_port=args.ssh_port
+        ssh_port=args.ssh_port,
+        location=args.location,
     )
 
     # Handle graceful shutdown
@@ -650,9 +667,16 @@ async def main():
             pass
 
     try:
-        # Initialize account manager
-        await init_account_manager(args.account_manager)
-        print(f"✓ Account manager connected at {args.account_manager}\n")
+        # Initialize account manager. No token file means every check below
+        # fails closed (the admin API refuses an unauthenticated request the
+        # same way it refuses a wrong one) — loud in the log, not fatal here.
+        if not args.account_manager_token_file:
+            print(
+                "⚠ --account-manager-token-file not set; every connection will be "
+                "denied by the admin API (fail-secure)"
+            )
+        await init_account_manager(args.account_manager, args.account_manager_token_file or "")
+        print(f"✓ Account manager: {args.account_manager} (location: {args.location})\n")
 
         with SSHServiceManager(args.ssh_host, args.ssh_port):
             await server.start()
