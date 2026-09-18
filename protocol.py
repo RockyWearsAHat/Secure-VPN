@@ -2,11 +2,13 @@
 SecureVPN Protocol Implementation
 
 Handles the handshake protocol and packet framing.
+Includes image-based authentication for visual entropy.
 """
 
 import hmac
 import struct
 import time
+import logging
 from enum import IntEnum
 from typing import Dict, Tuple, Optional
 from dataclasses import dataclass
@@ -15,6 +17,21 @@ from crypto_core import (
     IdentityKeys, KeyExchange, SecurityKeys, CryptoException,
     validate_timestamp, secure_random
 )
+
+logger = logging.getLogger(__name__)
+
+# Import image authentication modules (graceful fallback if not available)
+try:
+    from scripts.securevpn.app.vpn_image_auth import (
+        ImageAuthValidator, derive_auth_key, validate_auth_key, get_validator
+    )
+    from scripts.securevpn.app.admin_client import (
+        AdminAPIClient, CachedAdminAPIClient
+    )
+    _IMAGE_AUTH_AVAILABLE = True
+except ImportError:
+    _IMAGE_AUTH_AVAILABLE = False
+    logger.debug("Image authentication modules not available - running without image auth")
 
 # ML-KEM-768 is optional: only required to actually run a v2 (hybrid)
 # handshake. It is imported lazily inside the v2 code paths so that a v1-only
@@ -133,6 +150,70 @@ class SecureVPNProtocol:
         self.peer_roster = dict(peer_roster) if peer_roster else None
         self.session_keys: Optional[SecurityKeys] = None
         self.handshake_complete = False
+
+        # Image authentication setup (graceful fallback if unavailable)
+        self.image_auth_enabled = False
+        self.image_auth_validator = None
+        self.image_auth_client = None
+
+        if _IMAGE_AUTH_AVAILABLE:
+            try:
+                self.image_auth_validator = get_validator()
+                # Initialize cached API client for fetching images (default endpoint)
+                self.image_auth_client = CachedAdminAPIClient(
+                    base_url="http://localhost:8080"
+                )
+                self.image_auth_enabled = True
+                logger.debug("Image authentication enabled")
+            except Exception as e:
+                logger.warning(f"Failed to initialize image auth: {e}")
+                self.image_auth_enabled = False
+
+    def _refresh_image_auth(self) -> bool:
+        """
+        Refresh the image data from the admin API.
+
+        Returns:
+            True if image was successfully fetched and set, False otherwise.
+        """
+        if not self.image_auth_enabled or self.image_auth_client is None:
+            return False
+
+        try:
+            image_data = self.image_auth_client.fetch_image()
+            if image_data is not None and self.image_auth_validator is not None:
+                self.image_auth_validator.set_image_data(image_data)
+                logger.debug(f"Image auth refreshed: {len(image_data)} bytes")
+                return True
+        except Exception as e:
+            logger.warning(f"Failed to refresh image auth: {e}")
+
+        return False
+
+    def _validate_image_auth_key(self, auth_key: bytes) -> bool:
+        """
+        Validate an image authentication key.
+
+        Args:
+            auth_key: The 32-byte authentication key from the client.
+
+        Returns:
+            True if the key is valid or image auth is not enabled, False otherwise.
+        """
+        if not self.image_auth_enabled or self.image_auth_validator is None:
+            return True  # Allow if auth is not configured
+
+        # If we don't have an image yet, try to fetch one
+        if self.image_auth_validator.get_image_data() is None:
+            self._refresh_image_auth()
+
+        # If still no image, allow through with warning (graceful fallback)
+        if self.image_auth_validator.get_image_data() is None:
+            logger.warning("Image auth enabled but no image available - allowing peer through")
+            return True
+
+        # Validate the key
+        return self.image_auth_validator.validate_auth_key(auth_key)
 
     def _resolve_peer(self, presented_pubkey: bytes) -> Tuple[Optional[str], Optional[bytes]]:
         """
@@ -555,42 +636,52 @@ class SecureVPNProtocol:
     def process_client_auth(self, packet: bytes, state: HandshakeState, session_keys: SecurityKeys) -> bool:
         """
         Process CLIENT_AUTH packet (server-side, final handshake step).
-        
+
+        Supports both legacy 97-byte format (1+32+64) and extended 129-byte format
+        (1+32+64+32 with image auth key). Image authentication is validated if present.
+
         Args:
             packet: Encrypted CLIENT_AUTH packet
             state: Handshake state
             session_keys: Session keys
-            
+
         Returns:
             True if authentication successful
-            
+
         Raises:
             ProtocolError: On verification failure
         """
         try:
             # Decrypt packet
             plaintext = session_keys.decrypt(packet)
-            
-            if len(plaintext) != 97:  # 1+32+64
-                raise ProtocolError("CLIENT_AUTH plaintext invalid length")
-            
-            # Parse plaintext
-            pkt_type, client_id_pub, signature = struct.unpack('<B32s64s', plaintext)
-            
+
+            # Support both old (97 bytes) and new (129 bytes with auth_key) formats
+            auth_key = None
+            if len(plaintext) == 97:  # 1+32+64
+                pkt_type, client_id_pub, signature = struct.unpack('<B32s64s', plaintext)
+                logger.debug("CLIENT_AUTH: using legacy format (no image auth)")
+            elif len(plaintext) == 129:  # 1+32+64+32
+                pkt_type, client_id_pub, signature, auth_key = struct.unpack(
+                    '<B32s64s32s', plaintext
+                )
+                logger.debug("CLIENT_AUTH: using extended format (with image auth)")
+            else:
+                raise ProtocolError(f"CLIENT_AUTH plaintext invalid length: {len(plaintext)}")
+
             if pkt_type != PacketType.CLIENT_AUTH:
                 raise ProtocolError(f"Expected CLIENT_AUTH, got {pkt_type}")
-            
+
             # Verify client identity against the key THIS handshake resolved to
             # in CLIENT_HELLO, never against the handler's roster: presenting one
             # roster key in the hello and another in the auth must not pass.
             if not hmac.compare_digest(client_id_pub, state.peer_identity_pubkey):
                 raise ProtocolError("Client identity mismatch in AUTH")
-            
+
             # Type guard: ensure state is complete
             assert state.peer_ephemeral_pubkey is not None, "Peer ephemeral key not set"
             assert state.client_timestamp is not None, "Client timestamp not set"
             assert state.server_timestamp is not None, "Server timestamp not set"
-            
+
             # Verify signature
             sign_msg = (
                 state.peer_ephemeral_pubkey +
@@ -598,12 +689,18 @@ class SecureVPNProtocol:
                 struct.pack('<d', state.client_timestamp) +
                 struct.pack('<d', state.server_timestamp)
             )
-            
+
             if not IdentityKeys.verify_signature(client_id_pub, sign_msg, signature):
                 raise ProtocolError("Client signature verification failed")
-            
+
+            # Validate image authentication if provided
+            if auth_key is not None:
+                if not self._validate_image_auth_key(auth_key):
+                    raise ProtocolError("Image authentication key validation failed")
+                logger.debug(f"Image auth validated for peer {state.peer_name or 'unknown'}")
+
             return True
-            
+
         except CryptoException as e:
             raise ProtocolError(f"Decryption failed: {e}")
     
